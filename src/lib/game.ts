@@ -9,11 +9,21 @@ import {
   createDefaultLander,
   getTerrainHeightAt,
 } from "./simulation";
+import {
+  MSG_WORLD,
+  MSG_CRASH,
+  decodeWorldUpdate,
+  decodeCrash,
+  unpackThrust,
+  unpackState,
+} from "./protocol";
 
 // ─── Constants ────────────────────────────────────────────────
 
 const MAX_ZOOM = 4;
 const INPUT_INTERVAL = 50; // ms between input sends
+const MAX_DT = 0.1; // cap delta-time to prevent physics explosions
+const MAX_EXTRAPOLATION = 0.15; // max seconds to extrapolate beyond last server tick
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -30,28 +40,21 @@ interface Grave {
   color: RGB;
 }
 
-// Network message types
+// Network message types (JSON only — world/crash are binary)
 type ServerMessage =
   | {
       type: "init";
       id: string;
       color: RGB;
+      slot: number;
       seed: number;
       stage: number;
       players: Record<
         string,
-        { x: number; y: number; r: number; vx: number; vy: number; vr: number; t: number; a: number; fuel: number; score: number; color: RGB }
+        { x: number; y: number; r: number; vx: number; vy: number; vr: number; t: number; a: number; fuel: number; score: number; color: RGB; slot: number }
       >;
     }
-  | { type: "player_join"; id: string; color: RGB }
-  | {
-      type: "world";
-      players: Record<
-        string,
-        { x: number; y: number; r: number; vx: number; vy: number; vr: number; t: number; a: number; fuel: number; score: number; color: RGB; lastInputSeq: number }
-      >;
-    }
-  | { type: "crash"; x: number; y: number; color: RGB }
+  | { type: "player_join"; id: string; color: RGB; slot: number }
   | { type: "player_leave"; id: string }
   | { type: "new_round"; seed: number }
   | { type: "stage"; stage: number }
@@ -264,7 +267,9 @@ function drawArcadeBtn(
 // ─── Main Game ────────────────────────────────────────────────
 
 export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => void {
-  const ctx = canvas.getContext("2d")!;
+  const _ctx = canvas.getContext("2d");
+  if (!_ctx) throw new Error("Canvas 2D context not supported");
+  const ctx = _ctx;
 
   // ── State ──
   let myColor: RGB = [255, 255, 255];
@@ -276,6 +281,10 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
   let mapSeed = 1;
   let gameStage = 1;
   let myId = "";
+  let mySlot = 0;
+  const slotToId = new Map<number, string>();
+  const idToSlot = new Map<string, number>();
+  const idToColor = new Map<string, RGB>();
   let frameCount = 0;
   let lastTime = 0;
   let lastInputTime = 0;
@@ -344,7 +353,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
 
   // ── Load font ──
   const pixelFont = new FontFace("PixelHackers", "url(/PixelHackers.woff2)");
-  pixelFont.load().then((f) => document.fonts.add(f));
+  pixelFont.load().then((f) => document.fonts.add(f)).catch(() => {});
 
   // ── Network ──
   const socket = new PartySocket({
@@ -352,6 +361,8 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     party: "game-server",
     room: "main",
   });
+
+  socket.binaryType = "arraybuffer";
 
   socket.addEventListener("open", () => {
     connected = true;
@@ -361,6 +372,40 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
   });
 
   socket.addEventListener("message", (e) => {
+    // Binary messages: world updates and crash events
+    if (e.data instanceof ArrayBuffer) {
+      const msgType = new Uint8Array(e.data)[0];
+      if (msgType === MSG_WORLD) {
+        lastServerTime = performance.now();
+        const players = decodeWorldUpdate(e.data);
+        for (const p of players) {
+          const id = slotToId.get(p.slot);
+          if (!id) continue;
+          const color = idToColor.get(id) ?? myColor;
+          const t = unpackThrust(p.flags);
+          const a = unpackState(p.flags);
+          const snap: Lander = { x: p.x, y: p.y, r: p.r, vx: p.vx, vy: p.vy, vr: p.vr, t, a, fuel: p.fuel, color };
+          if (id === myId) {
+            serverMyLander = snap;
+            Object.assign(myLander, snap);
+            myFuel = p.fuel;
+            myScore = p.score;
+          } else {
+            serverRemoteLanders.set(id, snap);
+            remoteLanders.set(id, { ...snap });
+          }
+        }
+      } else if (msgType === MSG_CRASH) {
+        const c = decodeCrash(e.data);
+        if (c) {
+          crashes.push({ x: c.x, y: c.y, time: 0, color: c.color });
+          graves.push({ x: c.x, y: c.y, color: c.color });
+        }
+      }
+      return;
+    }
+
+    // JSON messages
     let data: ServerMessage;
     try {
       data = JSON.parse(e.data);
@@ -372,6 +417,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
       case "init":
         myId = data.id;
         myColor = data.color;
+        mySlot = data.slot;
         myLander = createDefaultLander(myColor);
         serverMyLander = { ...myLander };
         mapSeed = data.seed;
@@ -382,45 +428,40 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
         roundStartTime = performance.now();
         remoteLanders.clear();
         serverRemoteLanders.clear();
+        slotToId.clear();
+        idToSlot.clear();
+        idToColor.clear();
+        slotToId.set(mySlot, myId);
+        idToSlot.set(myId, mySlot);
+        idToColor.set(myId, myColor);
         for (const [id, player] of Object.entries(data.players)) {
-          const { x, y, r, vx, vy, vr, t, a, fuel, color } = player;
+          const { x, y, r, vx, vy, vr, t, a, fuel, color, slot } = player;
           const snap: Lander = { x, y, r, vx, vy, vr, t, a, fuel, color };
           remoteLanders.set(id, snap);
           serverRemoteLanders.set(id, { ...snap });
+          slotToId.set(slot, id);
+          idToSlot.set(id, slot);
+          idToColor.set(id, color);
         }
         lastServerTime = performance.now();
         break;
 
       case "player_join":
         remoteLanders.set(data.id, createDefaultLander(data.color));
+        slotToId.set(data.slot, data.id);
+        idToSlot.set(data.id, data.slot);
+        idToColor.set(data.id, data.color);
         break;
 
-      case "world":
-        lastServerTime = performance.now();
-        for (const [id, state] of Object.entries(data.players)) {
-          const { x, y, r, vx, vy, vr, t, a, fuel, score, color } = state;
-          const snap: Lander = { x, y, r, vx, vy, vr, t, a, fuel, color };
-          if (id === myId) {
-            serverMyLander = snap;
-            Object.assign(myLander, snap);
-            myFuel = fuel;
-            myScore = score;
-          } else {
-            serverRemoteLanders.set(id, snap);
-            remoteLanders.set(id, { ...snap });
-          }
-        }
-        break;
-
-      case "crash":
-        crashes.push({ x: data.x, y: data.y, time: 0, color: data.color });
-        graves.push({ x: data.x, y: data.y, color: data.color });
-        break;
-
-      case "player_leave":
+      case "player_leave": {
         remoteLanders.delete(data.id);
         serverRemoteLanders.delete(data.id);
+        const leftSlot = idToSlot.get(data.id);
+        if (leftSlot !== undefined) slotToId.delete(leftSlot);
+        idToSlot.delete(data.id);
+        idToColor.delete(data.id);
         break;
+      }
 
       case "new_round":
         mapSeed = data.seed;
@@ -477,7 +518,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
   function loop(time: number): void {
     animationId = requestAnimationFrame(loop);
 
-    const rawDt = lastTime === 0 ? 0.016 : (time - lastTime) / 1000;
+    const rawDt = Math.min(lastTime === 0 ? 0.016 : (time - lastTime) / 1000, MAX_DT);
     lastTime = time;
     frameCount++;
 
@@ -528,7 +569,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     // ── Client-side extrapolation (smooth 60fps from 20Hz server ticks) ──
     if (gameStage === 0) {
       const sinceTick = (performance.now() - lastServerTime) / 1000;
-      if (sinceTick > 0 && sinceTick < 0.15) {
+      if (sinceTick > 0 && sinceTick < MAX_EXTRAPOLATION) {
         // Extrapolate my lander from last server snapshot
         if (serverMyLander.a === 0) {
           myLander.x = serverMyLander.x + serverMyLander.vx * sinceTick;
@@ -582,9 +623,10 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
         targetCamS = Math.min(h / 2 / altAboveTerrain, maxZoom);
       }
 
-      // Smooth the camera zoom
+      // Smooth the camera zoom (frame-rate independent)
       if (smoothCamS === 0) smoothCamS = targetCamS;
-      smoothCamS += (targetCamS - smoothCamS) * 0.02;
+      const smoothFactor = 1 - Math.pow(0.98, rawDt * 60);
+      smoothCamS += (targetCamS - smoothCamS) * smoothFactor;
       camS = smoothCamS;
 
       ctx.translate(w / 2, h / 2);

@@ -13,6 +13,14 @@ import {
   isOutOfBounds,
   calculateLandingScore,
 } from "../lib/simulation";
+import {
+  type BinaryPlayerEntry,
+  type PlayerSnapshot,
+  encodeWorldUpdate,
+  encodeCrash,
+  packFlags,
+  hasStateChanged,
+} from "../lib/protocol";
 
 const COLORS: RGB[] = [
   [0, 255, 100],
@@ -28,6 +36,7 @@ const COLORS: RGB[] = [
 ];
 
 const TICK_MS = 50; // 20 Hz
+const MAX_PLAYERS = 255; // uint8 slot limit in binary protocol
 
 function randomSeed(): number {
   return Math.floor(Math.random() * 2147483647);
@@ -45,19 +54,29 @@ interface PlayerState {
   lastInput: PlayerInput;
   color: RGB;
   score: number;
+  slot: number;
 }
 
 export class GameServer extends Server<Env> {
   seed = randomSeed();
   stage = 1; // 0=playing, 1=waiting
   colorIndex = 0;
+  nextSlot = 0;
+  freeSlots: number[] = [];
   players = new Map<string, PlayerState>();
+  prevSent = new Map<string, PlayerSnapshot>();
   mapLines: MapLine[] = [];
   tickRunning = false;
 
   // Timers tracked as absolute timestamps (checked each tick)
   endgameDeadline = 0; // 0 = not active
   intermissionDeadline = 0; // 0 = not active
+
+  allocSlot(): number {
+    if (this.freeSlots.length > 0) return this.freeSlots.pop()!;
+    if (this.nextSlot >= MAX_PLAYERS) return -1;
+    return this.nextSlot++;
+  }
 
   // ── Alarm-based tick loop ────────────────────────────────────
 
@@ -126,50 +145,19 @@ export class GameServer extends Server<Env> {
           ps.lander.fuel += 50;
         }
         if (outcome === 2) {
-          this.broadcast(
-            JSON.stringify({
-              type: "crash",
-              x: ps.lander.x,
-              y: ps.lander.y,
-              color: ps.color,
-            }),
-          );
+          this.broadcast(encodeCrash(ps.lander.x, ps.lander.y, ps.color));
         }
       } else if (isOutOfBounds(ps.lander)) {
         ps.lander.a = 2;
         ps.score += 5; // crash score
-        this.broadcast(
-          JSON.stringify({
-            type: "crash",
-            x: ps.lander.x,
-            y: ps.lander.y,
-            color: ps.color,
-          }),
-        );
+        this.broadcast(encodeCrash(ps.lander.x, ps.lander.y, ps.color));
       }
     }
 
-    // Broadcast world snapshot
-    const playersData: Record<
-      string,
-      {
-        x: number;
-        y: number;
-        r: number;
-        vx: number;
-        vy: number;
-        vr: number;
-        t: number;
-        a: number;
-        fuel: number;
-        score: number;
-        color: RGB;
-        lastInputSeq: number;
-      }
-    > = {};
-
+    // Broadcast world snapshot (binary, delta-compressed)
+    const entries: BinaryPlayerEntry[] = [];
     for (const [id, ps] of this.players) {
-      playersData[id] = {
+      const curr: PlayerSnapshot = {
         x: ps.lander.x,
         y: ps.lander.y,
         r: ps.lander.r,
@@ -178,14 +166,31 @@ export class GameServer extends Server<Env> {
         vr: ps.lander.vr,
         t: ps.lander.t,
         a: ps.lander.a,
-        fuel: ps.lander.fuel,
+        fuel: Math.floor(ps.lander.fuel),
         score: ps.score,
-        color: ps.color,
-        lastInputSeq: ps.lastInput.seq,
       };
+
+      const prev = this.prevSent.get(id);
+      if (prev && !hasStateChanged(prev, curr)) continue;
+
+      this.prevSent.set(id, curr);
+      entries.push({
+        slot: ps.slot,
+        flags: packFlags(ps.lander.t, ps.lander.a),
+        x: ps.lander.x,
+        y: ps.lander.y,
+        r: ps.lander.r,
+        vx: ps.lander.vx,
+        vy: ps.lander.vy,
+        vr: ps.lander.vr,
+        fuel: Math.floor(ps.lander.fuel),
+        score: ps.score,
+      });
     }
 
-    this.broadcast(JSON.stringify({ type: "world", players: playersData }));
+    if (entries.length > 0) {
+      this.broadcast(encodeWorldUpdate(entries));
+    }
     this.checkEndgame();
   }
 
@@ -194,8 +199,39 @@ export class GameServer extends Server<Env> {
   onConnect(connection: Connection): void {
     const color = COLORS[this.colorIndex % COLORS.length];
     this.colorIndex++;
+    const slot = this.allocSlot();
 
-    // Build current player states for init
+    if (slot === -1) {
+      connection.close(4000, "Server full");
+      return;
+    }
+
+    // Transition from waiting → playing before building init payload
+    const wasWaiting = this.stage === 1;
+    if (wasWaiting) {
+      this.seed = randomSeed();
+      this.stage = 0;
+      this.mapLines = generateTerrain(this.seed);
+      this.endgameDeadline = 0;
+      this.intermissionDeadline = 0;
+      this.prevSent.clear();
+      // Reset existing players for the new round (preserve connections)
+      for (const [, ps] of this.players) {
+        ps.lander = createDefaultLander(ps.color);
+        ps.lastInput = { thrust: 0, rotation: 0, seq: 0 };
+      }
+    }
+
+    // Register the new player before building the init payload
+    this.players.set(connection.id, {
+      lander: createDefaultLander(color),
+      lastInput: { thrust: 0, rotation: 0, seq: 0 },
+      color,
+      score: 0,
+      slot,
+    });
+
+    // Build current player states for init (exclude self)
     const playersInit: Record<
       string,
       {
@@ -210,9 +246,11 @@ export class GameServer extends Server<Env> {
         fuel: number;
         score: number;
         color: RGB;
+        slot: number;
       }
     > = {};
     for (const [id, ps] of this.players) {
+      if (id === connection.id) continue;
       playersInit[id] = {
         x: ps.lander.x,
         y: ps.lander.y,
@@ -225,51 +263,36 @@ export class GameServer extends Server<Env> {
         fuel: ps.lander.fuel,
         score: ps.score,
         color: ps.color,
+        slot: ps.slot,
       };
     }
 
+    // Send init with correct seed/stage (after potential round transition)
     connection.send(
       JSON.stringify({
         type: "init",
         id: connection.id,
         color,
+        slot,
         seed: this.seed,
-
         stage: this.stage,
         players: playersInit,
       }),
     );
 
     this.broadcast(
-      JSON.stringify({ type: "player_join", id: connection.id, color }),
+      JSON.stringify({ type: "player_join", id: connection.id, color, slot }),
       [connection.id],
     );
 
-    const wasWaiting = this.stage === 1;
     if (wasWaiting) {
-      this.seed = randomSeed();
-      this.stage = 0;
-      this.mapLines = generateTerrain(this.seed);
-      this.players.clear();
-      this.endgameDeadline = 0;
-      this.intermissionDeadline = 0;
-    }
-
-    this.players.set(connection.id, {
-      lander: createDefaultLander(color),
-      lastInput: { thrust: 0, rotation: 0, seq: 0 },
-      color,
-      score: 0,
-    });
-
-    if (wasWaiting) {
+      // Notify existing players about the new round (new player already has correct data)
       this.broadcast(
-        JSON.stringify({
-          type: "new_round",
-          seed: this.seed,
-        }),
+        JSON.stringify({ type: "new_round", seed: this.seed }),
+        [connection.id],
       );
     }
+
     this.startTickLoop();
   }
 
@@ -291,12 +314,15 @@ export class GameServer extends Server<Env> {
     ps.lastInput = {
       thrust: data.thrust === 1 ? 1 : 0,
       rotation: data.rotation === -1 ? -1 : data.rotation === 1 ? 1 : 0,
-      seq: data.seq,
+      seq: typeof data.seq === "number" ? data.seq : 0,
     };
   }
 
   onClose(connection: Connection): void {
+    const ps = this.players.get(connection.id);
+    if (ps) this.freeSlots.push(ps.slot);
     this.players.delete(connection.id);
+    this.prevSent.delete(connection.id);
     this.broadcast(JSON.stringify({ type: "player_leave", id: connection.id }));
 
     if (this.players.size === 0) {
@@ -339,6 +365,7 @@ export class GameServer extends Server<Env> {
     this.stage = 0;
     this.mapLines = generateTerrain(this.seed);
     this.endgameDeadline = 0;
+    this.prevSent.clear();
 
     // Reset all connected players (preserve score across rounds)
     for (const [, ps] of this.players) {
