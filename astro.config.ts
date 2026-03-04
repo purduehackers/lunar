@@ -3,6 +3,7 @@ import cloudflare from "@astrojs/cloudflare";
 
 export default defineConfig({
   adapter: cloudflare(),
+  output: "server",
   vite: {
     optimizeDeps: {
       exclude: ["partysocket"],

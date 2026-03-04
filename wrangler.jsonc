@@ -1,28 +1,32 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "lunar",
-  "main": "./src/server/worker.ts",
-  "assets": {
-    "binding": "ASSETS",
-    "directory": "./dist",
-  },
-  "compatibility_date": "2026-02-28",
-  "compatibility_flags": ["nodejs_compat"],
-  "observability": {
-    "enabled": true,
-  },
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "GameServer",
-        "class_name": "GameServer",
-      },
-    ],
-  },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_classes": ["GameServer"],
-    },
-  ],
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "lunar",
+	"main": "./src/server/worker.ts",
+	"assets": {
+		"binding": "ASSETS",
+		"directory": "./dist",
+	},
+	"compatibility_date": "2026-02-28",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true,
+	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "GameServer",
+				"class_name": "GameServer",
+			},
+		],
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_classes": [
+				"GameServer"
+			],
+		},
+	],
 }
