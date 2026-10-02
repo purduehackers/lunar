@@ -1,5 +1,6 @@
 import PartySocket from "partysocket";
 import { shipColorName } from "./colors";
+import { approachBounds, groupApproaches, displayViewports, wrappedDistance } from "./display";
 import {
   type RGB,
   type Lander,
@@ -323,10 +324,9 @@ export function startGame(
 
   // Smooth camera zoom
   let smoothCamS = 0;
-  let displayCamX = MAP_WIDTH / 2;
-  let displayCamY = 600;
-  let focusId: string | null = null;
-  let focusHoldUntil = 0;
+  const approachIds = new Set<string>();
+  const landingHolds = new Map<string, number>();
+  let displayCameras = new Map<string, { x: number; y: number; scale: number }>();
   let landings: { color: RGB; expires: number }[] = [];
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
@@ -433,7 +433,7 @@ export function startGame(
           if (a === 1 && previous?.a === 0) {
             landings.push({ color, expires: performance.now() + 5000 });
             landings = landings.slice(-3);
-            if (id === focusId) focusHoldUntil = performance.now() + 3000;
+            if (approachIds.has(id)) landingHolds.set(id, performance.now() + 3000);
           }
           if (id === myId) {
             serverMyLander = snap;
@@ -466,8 +466,9 @@ export function startGame(
     switch (data.type) {
       case "init":
         landings = [];
-        focusId = null;
-        focusHoldUntil = 0;
+        approachIds.clear();
+        landingHolds.clear();
+        displayCameras.clear();
         smoothCamS = 0;
         endgameActive = false;
         myId = data.id;
@@ -522,8 +523,9 @@ export function startGame(
 
       case "new_round":
         landings = [];
-        focusId = null;
-        focusHoldUntil = 0;
+        approachIds.clear();
+        landingHolds.clear();
+        displayCameras.clear();
         mapSeed = data.seed;
         mapLines = generateTerrain(mapSeed);
         gameStage = 0;
@@ -671,9 +673,30 @@ export function startGame(
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, w, h);
 
-    // Camera setup
-    ctx.save();
-    let camS: number;
+    // Age effects once per frame, regardless of the number of split-screen panels.
+    crashes = crashes.filter((crash) => {
+      crash.time += rawDt * 1000;
+      return crash.time < 1000;
+    });
+
+    function drawWorld(camS: number): void {
+      const drawScale = (camS * dpr) / baseDpr;
+      drawTerrain(ctx, mapLines, drawScale, -1);
+      drawTerrain(ctx, mapLines, drawScale, 0);
+      drawTerrain(ctx, mapLines, drawScale, 1);
+      const offsets = display ? [-MAP_WIDTH, 0, MAP_WIDTH] : [0];
+      for (const offset of offsets) {
+        ctx.save();
+        ctx.translate(offset, 0);
+        for (const grave of graves) drawGrave(ctx, grave, drawScale);
+        for (const lander of remoteLanders.values()) {
+          if (lander.a !== 2) drawShip(ctx, lander, drawScale, frameCount);
+        }
+        for (const crash of crashes) drawCrashEffect(ctx, crash, drawScale);
+        ctx.restore();
+      }
+      if (!display && myLander.a !== 2) drawShip(ctx, myLander, drawScale, frameCount);
+    }
 
     if (display) {
       // Fit the entire terrain and every ship, including ships above the starting altitude.
@@ -691,135 +714,140 @@ export function startGame(
         0.01,
         Math.min((w - padding * 2) / MAP_WIDTH, (h - padding * 2) / (worldTop - worldBottom)),
       );
-      const altitude = (lander: Lander) => lander.y - getTerrainHeightAt(lander.x, mapLines);
-      let focused = focusId ? remoteLanders.get(focusId) : undefined;
-      // Keep a chosen approach stable instead of switching between nearby ships each frame.
-      const keepFocus =
-        gameStage === 0 &&
-        focused &&
-        ((focused.a === 0 && focused.vy <= 0 && altitude(focused) < 320) ||
-          (focused.a === 1 && time < focusHoldUntil));
-      if (!keepFocus) {
-        focusId = null;
-        focused = undefined;
-        if (gameStage === 0) {
-          let closestAltitude = 250;
-          for (const [id, lander] of remoteLanders) {
-            const height = altitude(lander);
-            if (lander.a === 0 && lander.vy < 0 && height >= 0 && height < closestAltitude) {
-              closestAltitude = height;
-              focusId = id;
-              focused = lander;
-            }
+      const ships = [];
+      for (const [id, lander] of remoteLanders) {
+        const altitude = lander.y - getTerrainHeightAt(lander.x, mapLines);
+        const approaching =
+          gameStage === 0 &&
+          lander.a === 0 &&
+          lander.vy <= 0 &&
+          altitude >= 0 &&
+          altitude < (approachIds.has(id) ? 320 : 250);
+        const holding = gameStage === 0 && lander.a === 1 && time < (landingHolds.get(id) ?? 0);
+        if (approaching || holding) ships.push({ id, lander });
+        if (approaching) approachIds.add(id);
+        else approachIds.delete(id);
+        if (!holding) landingHolds.delete(id);
+      }
+      for (const id of approachIds) {
+        if (!remoteLanders.has(id)) approachIds.delete(id);
+      }
+      // Stable player order keeps each approach in the same panel across updates.
+      ships.sort((a, b) => (idToSlot.get(a.id) ?? 0) - (idToSlot.get(b.id) ?? 0));
+      const groups = groupApproaches(ships, mapLines, w, h);
+      const viewports = displayViewports(Math.max(1, groups.length), w, h);
+      const nextCameras = new Map<string, { x: number; y: number; scale: number }>();
+      for (let i = 0; i < viewports.length; i++) {
+        const viewport = viewports[i];
+        const group = groups[i];
+        const bounds = group
+          ? approachBounds(group, mapLines)
+          : {
+              x: MAP_WIDTH / 2,
+              y: (worldTop + worldBottom) / 2,
+              width: MAP_WIDTH,
+              height: worldTop - worldBottom,
+            };
+        const key = group ? group.map((ship) => ship.id).join(",") : "fleet";
+        const targetScale = group
+          ? Math.max(
+              0.01,
+              Math.min(
+                isMobile ? 2 : MAX_ZOOM,
+                (viewport.width - 40) / bounds.width,
+                (viewport.height - 100) / bounds.height,
+              ),
+            )
+          : fleetScale;
+        // New panels begin centered on their ships; existing panels track smoothly.
+        const previous =
+          displayCameras.get(key) ??
+          (viewports.length === 1 && displayCameras.size === 1
+            ? displayCameras.values().next().value
+            : undefined);
+        const camera = previous
+          ? { ...previous }
+          : { x: bounds.x, y: bounds.y, scale: targetScale };
+        const blend = reducedMotion.matches ? 1 : 1 - Math.exp(-rawDt / 0.24);
+        camera.x =
+          (camera.x + wrappedDistance(bounds.x - camera.x) * blend + MAP_WIDTH) % MAP_WIDTH;
+        camera.y += (bounds.y - camera.y) * blend;
+        camera.scale += (targetScale - camera.scale) * blend;
+        nextCameras.set(key, camera);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(viewport.x, viewport.y, viewport.width, viewport.height);
+        ctx.clip();
+        ctx.save();
+        ctx.translate(viewport.x + viewport.width / 2, viewport.y + viewport.height / 2 + 20);
+        ctx.scale(camera.scale, camera.scale);
+        ctx.translate(-camera.x, camera.y);
+        drawWorld(camera.scale);
+        ctx.restore();
+        if (group) {
+          ctx.textAlign = "center";
+          ctx.font = `${isMobile ? 14 : 20}px 'PixelHackers', monospace`;
+          for (let j = 0; j < group.length; j++) {
+            const { lander } = group[j];
+            const label = `${shipColorName(lander.color)} ${lander.a === 1 ? "LANDED" : "APPROACHING"}`;
+            const labelY = viewport.y + 28 + j * 26;
+            ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
+            ctx.fillRect(viewport.x, labelY - 24, viewport.width, 26);
+            ctx.fillStyle = `rgb(${lander.color.join(",")})`;
+            ctx.fillText(label, viewport.x + viewport.width / 2, labelY, viewport.width - 24);
           }
         }
+        if (viewports.length > 1) {
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.3)";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(viewport.x, viewport.y, viewport.width, viewport.height);
+        }
+        ctx.restore();
       }
-      const targetScale = focused
-        ? Math.max(
-            fleetScale,
-            Math.min(isMobile ? 2 : MAX_ZOOM, (h - 160) / Math.max(240, altitude(focused) + 160)),
-          )
-        : fleetScale;
-      const targetX = focused ? focused.x : MAP_WIDTH / 2;
-      const targetY = focused
-        ? (focused.y + getTerrainHeightAt(focused.x, mapLines)) / 2 + 40
-        : (worldTop + worldBottom) / 2;
-      // Damped, interruptible tracking with no bounce; frame-rate independent.
-      const blend = reducedMotion.matches ? 1 : 1 - Math.exp(-rawDt / 0.24);
-      if (smoothCamS === 0) {
-        smoothCamS = fleetScale;
-        displayCamX = MAP_WIDTH / 2;
-        displayCamY = (worldTop + worldBottom) / 2;
-      }
-      smoothCamS += (targetScale - smoothCamS) * blend;
-      const dx = ((targetX - displayCamX + MAP_WIDTH * 1.5) % MAP_WIDTH) - MAP_WIDTH / 2;
-      displayCamX = (displayCamX + dx * blend + MAP_WIDTH) % MAP_WIDTH;
-      displayCamY += (targetY - displayCamY) * blend;
-      camS = smoothCamS;
-      ctx.translate(w / 2, h / 2);
-      ctx.scale(camS, camS);
-      ctx.translate(-displayCamX, displayCamY);
-    } else if (gameStage === 0) {
-      const camX = -myLander.x;
-      const camY = myLander.y;
-      const maxZoom = isMobile ? 2 : MAX_ZOOM;
-      const minZoom = isMobile ? 0.25 : 0.4;
-      const zoomThreshold = 250; // altitude above terrain where zoom kicks in
-
-      const terrainH = getTerrainHeightAt(myLander.x, mapLines);
-      const altAboveTerrain = Math.max(myLander.y - terrainH, 20);
-
-      let targetCamS: number;
-      if (altAboveTerrain > zoomThreshold) {
-        // Far from terrain — fixed wide zoom
-        targetCamS = minZoom;
-      } else {
-        // Close to terrain — zoom in proportionally
-        targetCamS = Math.min(h / 2 / altAboveTerrain, maxZoom);
-      }
-
-      // Smooth the camera zoom (frame-rate independent)
-      if (smoothCamS === 0) smoothCamS = targetCamS;
-      const smoothFactor = 1 - Math.pow(0.98, rawDt * 60);
-      smoothCamS += (targetCamS - smoothCamS) * smoothFactor;
-      camS = smoothCamS;
-
-      ctx.translate(w / 2, h / 2);
-      ctx.scale(camS, camS);
-      ctx.translate(camX, camY);
+      displayCameras = nextCameras;
     } else {
-      const dim = Math.min(w, h);
-      camS = dim / 2 / 600;
+      ctx.save();
+      let camS: number;
+      if (gameStage === 0) {
+        const camX = -myLander.x;
+        const camY = myLander.y;
+        const maxZoom = isMobile ? 2 : MAX_ZOOM;
+        const minZoom = isMobile ? 0.25 : 0.4;
+        const zoomThreshold = 250; // altitude above terrain where zoom kicks in
 
-      ctx.translate(w / 2, h / 2);
-      ctx.scale(camS, camS);
-      ctx.translate(-MAP_WIDTH / 2, dim / 2);
-    }
+        const terrainH = getTerrainHeightAt(myLander.x, mapLines);
+        const altAboveTerrain = Math.max(myLander.y - terrainH, 20);
 
-    // Scale factor for line widths: constant physical pixels regardless of browser zoom
-    const drawScale = (camS * dpr) / baseDpr;
-
-    // Terrain (3 instances for horizontal wrapping)
-    drawTerrain(ctx, mapLines, drawScale, -1);
-    drawTerrain(ctx, mapLines, drawScale, 0);
-    drawTerrain(ctx, mapLines, drawScale, 1);
-
-    // Graves
-    for (const grave of graves) {
-      drawGrave(ctx, grave, drawScale);
-    }
-
-    // Remote landers
-    for (const [, lander] of remoteLanders) {
-      if (lander.a !== 2) {
-        if (display) {
-          // Match the wrapped terrain while following a ship across the map edge.
-          for (const offset of [-MAP_WIDTH, 0, MAP_WIDTH]) {
-            ctx.save();
-            ctx.translate(offset, 0);
-            drawShip(ctx, lander, drawScale, frameCount);
-            ctx.restore();
-          }
+        let targetCamS: number;
+        if (altAboveTerrain > zoomThreshold) {
+          // Far from terrain — fixed wide zoom
+          targetCamS = minZoom;
         } else {
-          drawShip(ctx, lander, drawScale, frameCount);
+          // Close to terrain — zoom in proportionally
+          targetCamS = Math.min(h / 2 / altAboveTerrain, maxZoom);
         }
+
+        // Smooth the camera zoom (frame-rate independent)
+        if (smoothCamS === 0) smoothCamS = targetCamS;
+        const smoothFactor = 1 - Math.pow(0.98, rawDt * 60);
+        smoothCamS += (targetCamS - smoothCamS) * smoothFactor;
+        camS = smoothCamS;
+
+        ctx.translate(w / 2, h / 2);
+        ctx.scale(camS, camS);
+        ctx.translate(camX, camY);
+      } else {
+        const dim = Math.min(w, h);
+        camS = dim / 2 / 600;
+
+        ctx.translate(w / 2, h / 2);
+        ctx.scale(camS, camS);
+        ctx.translate(-MAP_WIDTH / 2, dim / 2);
       }
+
+      drawWorld(camS);
+      ctx.restore(); // camera
     }
-
-    // My lander
-    if (!display && myLander.a !== 2) {
-      drawShip(ctx, myLander, drawScale, frameCount);
-    }
-
-    // Crash effects
-    crashes = crashes.filter((c) => {
-      c.time += rawDt * 1000;
-      if (c.time >= 1000) return false;
-      drawCrashEffect(ctx, c, drawScale);
-      return true;
-    });
-
-    ctx.restore(); // camera
 
     // ── Mobile controls (arcade buttons, drawn under HUD text) ──
     if (!display && isMobile) {
@@ -860,20 +888,6 @@ export function startGame(
       ctx.fillText(`ALTITUDE  ${alt}`, w - hudPad, hudLine);
       ctx.fillText(`HORIZONTAL SPEED  ${absVx} ${hArrow}`, w - hudPad, hudLine * 2);
       ctx.fillText(`VERTICAL SPEED  ${absVy} ${vArrow}`, w - hudPad, hudLine * 3);
-    }
-
-    if (display && focusId) {
-      const focused = remoteLanders.get(focusId);
-      if (focused) {
-        ctx.textAlign = "center";
-        ctx.font = `${hudSize}px 'PixelHackers', monospace`;
-        ctx.fillStyle = `rgb(${focused.color.join(",")})`;
-        ctx.fillText(
-          `${shipColorName(focused.color)} ${focused.a === 1 ? "LANDED" : "APPROACHING"}`,
-          w / 2,
-          hudLine,
-        );
-      }
     }
 
     landings = landings.filter((landing) => landing.expires > time);
