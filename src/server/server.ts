@@ -96,10 +96,7 @@ export class GameServer extends Server<Env> {
 
   async onAlarm(): Promise<void> {
     // Handle intermission → new round transition (can happen while tick is stopped)
-    if (
-      this.intermissionDeadline > 0 &&
-      Date.now() >= this.intermissionDeadline
-    ) {
+    if (this.intermissionDeadline > 0 && Date.now() >= this.intermissionDeadline) {
       this.intermissionDeadline = 0;
       this.beginNewRound();
       return;
@@ -196,18 +193,19 @@ export class GameServer extends Server<Env> {
 
   // ── Connection Lifecycle ─────────────────────────────────────
 
-  onConnect(connection: Connection): void {
-    const color = COLORS[this.colorIndex % COLORS.length];
-    this.colorIndex++;
-    const slot = this.allocSlot();
+  onConnect(connection: Connection, context: { request: Request }): void {
+    const spectator = new URL(context.request.url).searchParams.get("mode") === "display";
+    const color: RGB = spectator ? [255, 255, 255] : COLORS[this.colorIndex % COLORS.length];
+    if (!spectator) this.colorIndex++;
+    const slot = spectator ? -1 : this.allocSlot();
 
-    if (slot === -1) {
+    if (!spectator && slot === -1) {
       connection.close(4000, "Server full");
       return;
     }
 
     // Transition from waiting → playing before building init payload
-    const wasWaiting = this.stage === 1;
+    const wasWaiting = !spectator && this.stage === 1;
     if (wasWaiting) {
       this.seed = randomSeed();
       this.stage = 0;
@@ -223,13 +221,14 @@ export class GameServer extends Server<Env> {
     }
 
     // Register the new player before building the init payload
-    this.players.set(connection.id, {
-      lander: createDefaultLander(color),
-      lastInput: { thrust: 0, rotation: 0, seq: 0 },
-      color,
-      score: 0,
-      slot,
-    });
+    if (!spectator)
+      this.players.set(connection.id, {
+        lander: createDefaultLander(color),
+        lastInput: { thrust: 0, rotation: 0, seq: 0 },
+        color,
+        score: 0,
+        slot,
+      });
 
     // Build current player states for init (exclude self)
     const playersInit: Record<
@@ -280,20 +279,17 @@ export class GameServer extends Server<Env> {
       }),
     );
 
-    this.broadcast(
-      JSON.stringify({ type: "player_join", id: connection.id, color, slot }),
-      [connection.id],
-    );
+    if (!spectator)
+      this.broadcast(JSON.stringify({ type: "player_join", id: connection.id, color, slot }), [
+        connection.id,
+      ]);
 
     if (wasWaiting) {
       // Notify existing players about the new round (new player already has correct data)
-      this.broadcast(
-        JSON.stringify({ type: "new_round", seed: this.seed }),
-        [connection.id],
-      );
+      this.broadcast(JSON.stringify({ type: "new_round", seed: this.seed }), [connection.id]);
     }
 
-    this.startTickLoop();
+    if (!spectator) this.startTickLoop();
   }
 
   onMessage(connection: Connection, message: string | ArrayBuffer): void {
@@ -320,12 +316,15 @@ export class GameServer extends Server<Env> {
 
   onClose(connection: Connection): void {
     const ps = this.players.get(connection.id);
-    if (ps) this.freeSlots.push(ps.slot);
+    if (!ps) return;
+    this.freeSlots.push(ps.slot);
     this.players.delete(connection.id);
     this.prevSent.delete(connection.id);
     this.broadcast(JSON.stringify({ type: "player_leave", id: connection.id }));
 
     if (this.players.size === 0) {
+      this.stage = 1;
+      this.broadcast(JSON.stringify({ type: "stage", stage: 1 }));
       this.stopTickLoop();
       this.endgameDeadline = 0;
       this.intermissionDeadline = 0;

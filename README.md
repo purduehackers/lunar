@@ -4,6 +4,8 @@ Multiplayer lunar lander game. Land your spacecraft on procedurally generated te
 
 Built with Astro, PartyServer (Cloudflare Durable Objects), and canvas.
 
+Open `/display` for a spectator display of the whole fleet. Display browsers do not create ships or participate in rounds.
+
 ## Controls
 
 - **Arrow keys / WASD** — rotate and thrust

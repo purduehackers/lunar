@@ -1,0 +1,58 @@
+---
+interface Props {
+  display?: boolean;
+}
+const { display = false } = Astro.props;
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Lunar Lander</title>
+    <meta name="description" content="Multiplayer lunar lander. Land your spacecraft on procedurally generated terrain. Crash and leave your grave for others to see." />
+    <meta name="theme-color" content="#000000" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+    <meta property="og:title" content="Lunar Lander" />
+    <meta property="og:description" content="Multiplayer lunar lander. Land your spacecraft — or crash trying." />
+    <meta property="og:type" content="website" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <style>
+      @font-face {
+        font-family: "PixelHackers";
+        src: url("/PixelHackers.woff2") format("woff2");
+        font-display: block;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #000;
+        touch-action: none;
+      }
+      canvas {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="game" data-display={display ? "true" : "false"}></canvas>
+    <script>
+      import { startGame } from "../lib/game";
+
+      const canvas = document.getElementById("game") as HTMLCanvasElement;
+      startGame(canvas, window.location.host, { display: canvas.dataset.display === "true" });
+    </script>
+  </body>
+</html>

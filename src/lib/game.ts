@@ -51,7 +51,20 @@ type ServerMessage =
       stage: number;
       players: Record<
         string,
-        { x: number; y: number; r: number; vx: number; vy: number; vr: number; t: number; a: number; fuel: number; score: number; color: RGB; slot: number }
+        {
+          x: number;
+          y: number;
+          r: number;
+          vx: number;
+          vy: number;
+          vr: number;
+          t: number;
+          a: number;
+          fuel: number;
+          score: number;
+          color: RGB;
+          slot: number;
+        }
       >;
     }
   | { type: "player_join"; id: string; color: RGB; slot: number }
@@ -266,7 +279,12 @@ function drawArcadeBtn(
 
 // ─── Main Game ────────────────────────────────────────────────
 
-export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => void {
+export function startGame(
+  canvas: HTMLCanvasElement,
+  workerHost: string,
+  options: { display?: boolean } = {},
+): () => void {
+  const display = options.display === true;
   const _ctx = canvas.getContext("2d");
   if (!_ctx) throw new Error("Canvas 2D context not supported");
   const ctx = _ctx;
@@ -323,8 +341,10 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     keysDown.delete(e.key);
   }
 
-  window.addEventListener("keydown", onKeyDown);
-  window.addEventListener("keyup", onKeyUp);
+  if (!display) {
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+  }
 
   // Touch input
   let activeTouches: { x: number; y: number }[] = [];
@@ -332,10 +352,12 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     e.preventDefault();
     activeTouches = Array.from(e.touches).map((t) => ({ x: t.clientX, y: t.clientY }));
   }
-  canvas.addEventListener("touchstart", handleTouch);
-  canvas.addEventListener("touchmove", handleTouch);
-  canvas.addEventListener("touchend", handleTouch);
-  canvas.addEventListener("touchcancel", handleTouch);
+  if (!display) {
+    canvas.addEventListener("touchstart", handleTouch);
+    canvas.addEventListener("touchmove", handleTouch);
+    canvas.addEventListener("touchend", handleTouch);
+    canvas.addEventListener("touchcancel", handleTouch);
+  }
 
   // ── Resize (with HiDPI support) ──
   const baseDpr = window.devicePixelRatio || 1;
@@ -353,13 +375,17 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
 
   // ── Load font ──
   const pixelFont = new FontFace("PixelHackers", "url(/PixelHackers.woff2)");
-  pixelFont.load().then((f) => document.fonts.add(f)).catch(() => {});
+  pixelFont
+    .load()
+    .then((f) => document.fonts.add(f))
+    .catch(() => {});
 
   // ── Network ──
   const socket = new PartySocket({
     host: workerHost,
     party: "game-server",
     room: "main",
+    query: display ? { mode: "display" } : {},
   });
 
   socket.binaryType = "arraybuffer";
@@ -384,7 +410,18 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
           const color = idToColor.get(id) ?? myColor;
           const t = unpackThrust(p.flags);
           const a = unpackState(p.flags);
-          const snap: Lander = { x: p.x, y: p.y, r: p.r, vx: p.vx, vy: p.vy, vr: p.vr, t, a, fuel: p.fuel, color };
+          const snap: Lander = {
+            x: p.x,
+            y: p.y,
+            r: p.r,
+            vx: p.vx,
+            vy: p.vy,
+            vr: p.vr,
+            t,
+            a,
+            fuel: p.fuel,
+            color,
+          };
           if (id === myId) {
             serverMyLander = snap;
             Object.assign(myLander, snap);
@@ -431,9 +468,11 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
         slotToId.clear();
         idToSlot.clear();
         idToColor.clear();
-        slotToId.set(mySlot, myId);
-        idToSlot.set(myId, mySlot);
-        idToColor.set(myId, myColor);
+        if (!display) {
+          slotToId.set(mySlot, myId);
+          idToSlot.set(myId, mySlot);
+          idToColor.set(myId, myColor);
+        }
         for (const [id, player] of Object.entries(data.players)) {
           const { x, y, r, vx, vy, vr, t, a, fuel, color, slot } = player;
           const snap: Lander = { x, y, r, vx, vy, vr, t, a, fuel, color };
@@ -533,7 +572,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     const leftBtn = { x: w / 2 - btnGap, y: btnBaseY };
     const rightBtn = { x: w / 2 + btnGap, y: btnBaseY };
     const thrustBtn = { x: w / 2, y: btnBaseY - btnR * 1.8 };
-    const hitR2 = (btnR * 1.4) * (btnR * 1.4);
+    const hitR2 = btnR * 1.4 * (btnR * 1.4);
 
     // ── Handle Input ──
     let rotation: -1 | 0 | 1 = 0;
@@ -543,22 +582,27 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
 
     if (isMobile) {
       for (const touch of activeTouches) {
-        const dxL = touch.x - leftBtn.x, dyL = touch.y - leftBtn.y;
-        const dxR = touch.x - rightBtn.x, dyR = touch.y - rightBtn.y;
-        const dxT = touch.x - thrustBtn.x, dyT = touch.y - thrustBtn.y;
+        const dxL = touch.x - leftBtn.x,
+          dyL = touch.y - leftBtn.y;
+        const dxR = touch.x - rightBtn.x,
+          dyR = touch.y - rightBtn.y;
+        const dxT = touch.x - thrustBtn.x,
+          dyT = touch.y - thrustBtn.y;
         if (dxL * dxL + dyL * dyL <= hitR2) foundLT = true;
         if (dxR * dxR + dyR * dyR <= hitR2) foundRT = true;
         if (dxT * dxT + dyT * dyT <= hitR2) foundCT = true;
       }
     }
 
-    if (keysDown.has("ArrowLeft") || keysDown.has("a") || keysDown.has("A") || foundLT) rotation = -1;
-    if (keysDown.has("ArrowRight") || keysDown.has("d") || keysDown.has("D") || foundRT) rotation = rotation === -1 ? 0 : 1;
+    if (keysDown.has("ArrowLeft") || keysDown.has("a") || keysDown.has("A") || foundLT)
+      rotation = -1;
+    if (keysDown.has("ArrowRight") || keysDown.has("d") || keysDown.has("D") || foundRT)
+      rotation = rotation === -1 ? 0 : 1;
     const thrust: 0 | 1 =
       keysDown.has("ArrowUp") || keysDown.has("w") || keysDown.has("W") || foundCT ? 1 : 0;
 
     // Send input to server when it changes, or at minimum interval
-    if (gameStage === 0 && myLander.a === 0) {
+    if (!display && gameStage === 0 && myLander.a === 0) {
       const changed = thrust !== lastSentThrust || rotation !== lastSentRotation;
       if (changed || time - lastInputTime >= INPUT_INTERVAL) {
         lastInputTime = time;
@@ -571,7 +615,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
       const sinceTick = (performance.now() - lastServerTime) / 1000;
       if (sinceTick > 0 && sinceTick < MAX_EXTRAPOLATION) {
         // Extrapolate my lander from last server snapshot
-        if (serverMyLander.a === 0) {
+        if (!display && serverMyLander.a === 0) {
           myLander.x = serverMyLander.x + serverMyLander.vx * sinceTick;
           myLander.y = serverMyLander.y + serverMyLander.vy * sinceTick;
           myLander.r = serverMyLander.r + serverMyLander.vr * sinceTick;
@@ -604,7 +648,26 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     ctx.save();
     let camS: number;
 
-    if (gameStage === 0) {
+    if (display) {
+      // Fit the entire terrain and every ship, including ships above the starting altitude.
+      const terrainTop = Math.max(1200, ...mapLines.map((line) => Math.max(line[1], line[3])));
+      const worldTop = Math.max(
+        terrainTop,
+        ...Array.from(remoteLanders.values(), (lander) => lander.y + 60),
+      );
+      const worldBottom = Math.min(
+        0,
+        ...Array.from(remoteLanders.values(), (lander) => lander.y - 60),
+      );
+      const padding = 40;
+      camS = Math.max(
+        0.01,
+        Math.min((w - padding * 2) / MAP_WIDTH, (h - padding * 2) / (worldTop - worldBottom)),
+      );
+      ctx.translate(w / 2, h / 2);
+      ctx.scale(camS, camS);
+      ctx.translate(-MAP_WIDTH / 2, (worldTop + worldBottom) / 2);
+    } else if (gameStage === 0) {
       const camX = -myLander.x;
       const camY = myLander.y;
       const maxZoom = isMobile ? 2 : MAX_ZOOM;
@@ -642,7 +705,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     }
 
     // Scale factor for line widths: constant physical pixels regardless of browser zoom
-    const drawScale = camS * dpr / baseDpr;
+    const drawScale = (camS * dpr) / baseDpr;
 
     // Terrain (3 instances for horizontal wrapping)
     drawTerrain(ctx, mapLines, drawScale, -1);
@@ -662,7 +725,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     }
 
     // My lander
-    if (myLander.a !== 2) {
+    if (!display && myLander.a !== 2) {
       drawShip(ctx, myLander, drawScale, frameCount);
     }
 
@@ -677,7 +740,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     ctx.restore(); // camera
 
     // ── Mobile controls (arcade buttons, drawn under HUD text) ──
-    if (isMobile) {
+    if (!display && isMobile) {
       drawArcadeBtn(ctx, leftBtn.x, leftBtn.y, btnR, "\u25C0", foundLT);
       drawArcadeBtn(ctx, rightBtn.x, rightBtn.y, btnR, "\u25B6", foundRT);
       drawArcadeBtn(ctx, thrustBtn.x, thrustBtn.y, btnR, "\u25B2", foundCT);
@@ -688,7 +751,7 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     const hudLine = isMobile ? 22 : 32;
     const hudPad = 12;
 
-    if (gameStage === 0) {
+    if (!display && gameStage === 0) {
       ctx.font = `${hudSize}px 'PixelHackers', monospace`;
       ctx.fillStyle = "#ffffff";
 
@@ -720,10 +783,10 @@ export function startGame(canvas: HTMLCanvasElement, workerHost: string): () => 
     // Win/crash overlay
     ctx.textAlign = "center";
     ctx.font = `${isMobile ? 32 : 48}px 'PixelHackers', monospace`;
-    if (myLander.a === 1) {
+    if (!display && myLander.a === 1) {
       ctx.fillStyle = "#00ff64";
       ctx.fillText("LANDED", w / 2, h / 3);
-    } else if (myLander.a === 2) {
+    } else if (!display && myLander.a === 2) {
       ctx.fillStyle = "#ff5050";
       ctx.fillText("CRASHED", w / 2, h / 3);
     }
