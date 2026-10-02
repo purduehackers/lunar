@@ -1,4 +1,5 @@
 import PartySocket from "partysocket";
+import { shipColorName } from "./colors";
 import {
   type RGB,
   type Lander,
@@ -322,6 +323,12 @@ export function startGame(
 
   // Smooth camera zoom
   let smoothCamS = 0;
+  let displayCamX = MAP_WIDTH / 2;
+  let displayCamY = 600;
+  let focusId: string | null = null;
+  let focusHoldUntil = 0;
+  let landings: { color: RGB; expires: number }[] = [];
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
   // Client-side interpolation: snapshot server state, extrapolate between ticks
   let serverMyLander: Lander = { ...myLander };
@@ -422,6 +429,12 @@ export function startGame(
             fuel: p.fuel,
             color,
           };
+          const previous = id === myId ? serverMyLander : remoteLanders.get(id);
+          if (a === 1 && previous?.a === 0) {
+            landings.push({ color, expires: performance.now() + 5000 });
+            landings = landings.slice(-3);
+            if (id === focusId) focusHoldUntil = performance.now() + 3000;
+          }
           if (id === myId) {
             serverMyLander = snap;
             Object.assign(myLander, snap);
@@ -452,6 +465,11 @@ export function startGame(
 
     switch (data.type) {
       case "init":
+        landings = [];
+        focusId = null;
+        focusHoldUntil = 0;
+        smoothCamS = 0;
+        endgameActive = false;
         myId = data.id;
         myColor = data.color;
         mySlot = data.slot;
@@ -503,6 +521,9 @@ export function startGame(
       }
 
       case "new_round":
+        landings = [];
+        focusId = null;
+        focusHoldUntil = 0;
         mapSeed = data.seed;
         mapLines = generateTerrain(mapSeed);
         gameStage = 0;
@@ -512,6 +533,12 @@ export function startGame(
         roundStartTime = performance.now();
         remoteLanders.clear();
         serverRemoteLanders.clear();
+        for (const [id, color] of idToColor) {
+          if (id === myId) continue;
+          const lander = createDefaultLander(color);
+          remoteLanders.set(id, lander);
+          serverRemoteLanders.set(id, { ...lander });
+        }
         crashes = [];
         graves = [];
         endgameActive = false;
@@ -660,13 +687,58 @@ export function startGame(
         ...Array.from(remoteLanders.values(), (lander) => lander.y - 60),
       );
       const padding = 40;
-      camS = Math.max(
+      const fleetScale = Math.max(
         0.01,
         Math.min((w - padding * 2) / MAP_WIDTH, (h - padding * 2) / (worldTop - worldBottom)),
       );
+      const altitude = (lander: Lander) => lander.y - getTerrainHeightAt(lander.x, mapLines);
+      let focused = focusId ? remoteLanders.get(focusId) : undefined;
+      // Keep a chosen approach stable instead of switching between nearby ships each frame.
+      const keepFocus =
+        gameStage === 0 &&
+        focused &&
+        ((focused.a === 0 && focused.vy <= 0 && altitude(focused) < 320) ||
+          (focused.a === 1 && time < focusHoldUntil));
+      if (!keepFocus) {
+        focusId = null;
+        focused = undefined;
+        if (gameStage === 0) {
+          let closestAltitude = 250;
+          for (const [id, lander] of remoteLanders) {
+            const height = altitude(lander);
+            if (lander.a === 0 && lander.vy < 0 && height >= 0 && height < closestAltitude) {
+              closestAltitude = height;
+              focusId = id;
+              focused = lander;
+            }
+          }
+        }
+      }
+      const targetScale = focused
+        ? Math.max(
+            fleetScale,
+            Math.min(isMobile ? 2 : MAX_ZOOM, (h - 160) / Math.max(240, altitude(focused) + 160)),
+          )
+        : fleetScale;
+      const targetX = focused ? focused.x : MAP_WIDTH / 2;
+      const targetY = focused
+        ? (focused.y + getTerrainHeightAt(focused.x, mapLines)) / 2 + 40
+        : (worldTop + worldBottom) / 2;
+      // Damped, interruptible tracking with no bounce; frame-rate independent.
+      const blend = reducedMotion.matches ? 1 : 1 - Math.exp(-rawDt / 0.24);
+      if (smoothCamS === 0) {
+        smoothCamS = fleetScale;
+        displayCamX = MAP_WIDTH / 2;
+        displayCamY = (worldTop + worldBottom) / 2;
+      }
+      smoothCamS += (targetScale - smoothCamS) * blend;
+      const dx = ((targetX - displayCamX + MAP_WIDTH * 1.5) % MAP_WIDTH) - MAP_WIDTH / 2;
+      displayCamX = (displayCamX + dx * blend + MAP_WIDTH) % MAP_WIDTH;
+      displayCamY += (targetY - displayCamY) * blend;
+      camS = smoothCamS;
       ctx.translate(w / 2, h / 2);
       ctx.scale(camS, camS);
-      ctx.translate(-MAP_WIDTH / 2, (worldTop + worldBottom) / 2);
+      ctx.translate(-displayCamX, displayCamY);
     } else if (gameStage === 0) {
       const camX = -myLander.x;
       const camY = myLander.y;
@@ -720,7 +792,17 @@ export function startGame(
     // Remote landers
     for (const [, lander] of remoteLanders) {
       if (lander.a !== 2) {
-        drawShip(ctx, lander, drawScale, frameCount);
+        if (display) {
+          // Match the wrapped terrain while following a ship across the map edge.
+          for (const offset of [-MAP_WIDTH, 0, MAP_WIDTH]) {
+            ctx.save();
+            ctx.translate(offset, 0);
+            drawShip(ctx, lander, drawScale, frameCount);
+            ctx.restore();
+          }
+        } else {
+          drawShip(ctx, lander, drawScale, frameCount);
+        }
       }
     }
 
@@ -778,6 +860,34 @@ export function startGame(
       ctx.fillText(`ALTITUDE  ${alt}`, w - hudPad, hudLine);
       ctx.fillText(`HORIZONTAL SPEED  ${absVx} ${hArrow}`, w - hudPad, hudLine * 2);
       ctx.fillText(`VERTICAL SPEED  ${absVy} ${vArrow}`, w - hudPad, hudLine * 3);
+    }
+
+    if (display && focusId) {
+      const focused = remoteLanders.get(focusId);
+      if (focused) {
+        ctx.textAlign = "center";
+        ctx.font = `${hudSize}px 'PixelHackers', monospace`;
+        ctx.fillStyle = `rgb(${focused.color.join(",")})`;
+        ctx.fillText(
+          `${shipColorName(focused.color)} ${focused.a === 1 ? "LANDED" : "APPROACHING"}`,
+          w / 2,
+          hudLine,
+        );
+      }
+    }
+
+    landings = landings.filter((landing) => landing.expires > time);
+    ctx.textAlign = "center";
+    ctx.font = `${isMobile ? 18 : 28}px 'PixelHackers', monospace`;
+    for (let i = 0; i < landings.length; i++) {
+      const landing = landings[i];
+      const message = `${shipColorName(landing.color)} LANDED!`;
+      const y = (display ? h - 32 : h * 0.7) - (landings.length - 1 - i) * 40;
+      const width = Math.min(ctx.measureText(message).width, Math.max(1, w - 32));
+      ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
+      ctx.fillRect(w / 2 - width / 2 - 16, y - 30, width + 32, 40);
+      ctx.fillStyle = `rgb(${landing.color.join(",")})`;
+      ctx.fillText(message, w / 2, y, width);
     }
 
     // Win/crash overlay

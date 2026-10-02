@@ -22,18 +22,9 @@ import {
   hasStateChanged,
 } from "../lib/protocol";
 
-const COLORS: RGB[] = [
-  [0, 255, 100],
-  [255, 80, 80],
-  [80, 130, 255],
-  [255, 255, 0],
-  [255, 0, 255],
-  [0, 255, 255],
-  [255, 165, 0],
-  [255, 120, 200],
-  [150, 255, 150],
-  [200, 150, 255],
-];
+import { SHIP_COLORS } from "../lib/colors";
+
+const COLORS = SHIP_COLORS.map((ship) => ship.color);
 
 const TICK_MS = 50; // 20 Hz
 const MAX_PLAYERS = 255; // uint8 slot limit in binary protocol
