@@ -1,0 +1,67 @@
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lunar Lander / Camera</title>
+    <style is:inline>
+      @font-face { font-family: PixelHackers; src: url('/PixelHackers.woff2'); font-display: swap; }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: #080808; color: #f5f5f5; font-family: PixelHackers, monospace; }
+      main { max-width: 980px; margin: auto; padding: 40px 24px; }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 24px; border-bottom: 1px solid #555; padding-bottom: 28px; }
+      h1 { font-size: clamp(24px, 4vw, 40px); font-weight: normal; margin: 0; }
+      h2 { font-size: 20px; font-weight: normal; margin: 0 0 24px; }
+      a { color: inherit; font-size: 12px; }
+      .connection { color: #aaa; font-size: 12px; margin: 20px 0 32px; }
+      .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; }
+      button { background: #161616; color: #f5f5f5; border: 1px solid #666; min-height: 56px; padding: 14px; font: 14px PixelHackers, monospace; cursor: pointer; touch-action: manipulation; }
+      button:focus-visible { outline: 2px solid #f5f5f5; outline-offset: 4px; }
+      button:hover { background: #292929; }
+      button:disabled { opacity: .4; cursor: default; }
+      .pan { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+      .pan [data-pan="up"] { grid-column: 2; }
+      .pan [data-pan="left"] { grid-column: 1; }
+      .pan [data-pan="down"] { grid-column: 2; }
+      .zoom { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px 0; }
+      .reset { width: 100%; }
+      .help { font-size: 12px; color: #aaa; line-height: 1.8; }
+      .ships { display: grid; gap: 8px; }
+      .ship { text-align: left; display: flex; align-items: center; gap: 12px; overflow-wrap: anywhere; }
+      .ship[aria-pressed="true"] { background: #f5f5f5; color: #080808; }
+      .ship-dot { width: 10px; height: 10px; flex-shrink: 0; }
+      #stop-follow { width: 100%; margin-top: 16px; }
+      #camera-mode { min-height: 36px; font-size: 14px; line-height: 1.5; }
+      @media(max-width: 650px) { header { align-items: flex-start; flex-direction: column; } .layout { grid-template-columns: 1fr; gap: 36px; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header><h1>DISPLAY CAMERA</h1><a href="/display" target="_blank" rel="noopener">OPEN DISPLAY ↗</a></header>
+      <p id="connection" class="connection" role="status">CONNECTING...</p>
+      <div class="layout">
+        <section aria-label="Camera controls">
+          <h2>PAN & ZOOM</h2>
+          <div class="pan">
+            <button data-pan="up" aria-label="Pan up">UP ↑</button>
+            <button data-pan="left" aria-label="Pan left">← LEFT</button>
+            <button data-pan="down" aria-label="Pan down">DOWN ↓</button>
+            <button data-pan="right" aria-label="Pan right">RIGHT →</button>
+          </div>
+          <div class="zoom"><button data-zoom="1.25">ZOOM IN +</button><button data-zoom="0.8">ZOOM OUT −</button></div>
+          <button id="reset" class="reset">RESET TO AUTO</button>
+          <p class="help">Arrow keys to pan. + / − to zoom.</p>
+        </section>
+        <section aria-label="Follow a ship">
+          <h2>FOLLOW A SHIP</h2>
+          <p id="camera-mode" role="status">AUTOMATIC CAMERA</p>
+          <div id="ships" class="ships"></div>
+          <button id="stop-follow">STOP FOLLOWING</button>
+        </section>
+      </div>
+    </main>
+    <script>
+      import { startCameraControls } from '../lib/camera-controls';
+      startCameraControls(window.location.host);
+    </script>
+  </body>
+</html>

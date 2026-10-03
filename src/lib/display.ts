@@ -54,6 +54,16 @@ export function groupApproaches(
   return groups;
 }
 
+export function cameraGroups(
+  approaches: DisplayShip[],
+  followed: DisplayShip | undefined,
+  terrain: MapLine[],
+  width: number,
+  height: number,
+): DisplayShip[][] {
+  return followed ? [[followed]] : groupApproaches(approaches, terrain, width, height);
+}
+
 export function displayViewports(count: number, width: number, height: number): DisplayBounds[] {
   if (count <= 1) return [{ x: 0, y: 0, width, height }];
   if (count === 2) {

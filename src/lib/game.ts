@@ -1,6 +1,10 @@
+import { createDisplaySettings } from "./display-settings-screen";
+import type { CameraState } from "./camera";
+import { createStatsScreen } from "./stats-screen";
+import type { SessionStats } from "./session-stats";
 import PartySocket from "partysocket";
 import { normalizeName } from "./names";
-import { approachBounds, groupApproaches, displayViewports, wrappedDistance } from "./display";
+import { approachBounds, cameraGroups, displayViewports, wrappedDistance } from "./display";
 import {
   type RGB,
   type Lander,
@@ -46,12 +50,16 @@ interface Grave {
 type ServerMessage =
   | {
       type: "init";
+      camera: CameraState;
+      self: { lander: Lander; score: number } | null;
+      stats: SessionStats | null;
       id: string;
       name?: string;
       color: RGB;
       slot: number;
       seed: number;
       stage: number;
+      revealMs: number;
       players: Record<
         string,
         {
@@ -68,12 +76,16 @@ type ServerMessage =
           color: RGB;
           slot: number;
           name?: string;
+          pilotId: string;
         }
       >;
     }
-  | { type: "player_join"; id: string; color: RGB; slot: number; name?: string }
+  | { type: "superseded" }
+  | { type: "stats"; stats: SessionStats | null }
+  | { type: "camera"; camera: CameraState }
+  | { type: "player_join"; id: string; pilotId: string; color: RGB; slot: number; name?: string }
   | { type: "player_leave"; id: string }
-  | { type: "new_round"; seed: number }
+  | { type: "new_round"; seed: number; revealMs: number }
   | { type: "stage"; stage: number }
   | { type: "endgame_start" }
   | { type: "endgame_cancel" };
@@ -155,31 +167,38 @@ function drawTerrain(
   mapLines: MapLine[],
   scale: number,
   offset: number,
+  progress = 1,
 ): void {
   const ox = offset * MAP_WIDTH;
 
-  // Draw terrain lines
+  const totalLength = mapLines.reduce(
+    (sum, line) => sum + Math.hypot(line[2] - line[0], line[3] - line[1]), 0,
+  );
+  let remaining = totalLength * progress;
+  ctx.save();
   ctx.strokeStyle = "#ffffff";
-  ctx.lineWidth = 3 / scale;
-  ctx.beginPath();
   for (const line of mapLines) {
-    if (line[1] !== line[3]) {
-      ctx.moveTo(line[0] + ox, line[1]);
-      ctx.lineTo(line[2] + ox, line[3]);
+    if (remaining <= 0) break;
+    const length = Math.hypot(line[2] - line[0], line[3] - line[1]);
+    const fraction = length === 0 ? 1 : Math.min(1, remaining / length);
+    const x = line[0] + (line[2] - line[0]) * fraction + ox;
+    const y = line[1] + (line[3] - line[1]) * fraction;
+    ctx.lineWidth = (line[1] === line[3] ? 6 : 3) / scale;
+    ctx.beginPath();
+    ctx.moveTo(line[0] + ox, line[1]);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    if (progress < 1 && remaining <= length) {
+      ctx.shadowColor = "#ffffff";
+      ctx.shadowBlur = 14;
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.arc(x, y, 5 / scale, 0, Math.PI * 2);
+      ctx.fill();
     }
+    remaining -= length;
   }
-  ctx.stroke();
-
-  // Draw landing pads (flat segments) bolder
-  ctx.lineWidth = 6 / scale;
-  ctx.beginPath();
-  for (const line of mapLines) {
-    if (line[1] === line[3]) {
-      ctx.moveTo(line[0] + ox, line[1]);
-      ctx.lineTo(line[2] + ox, line[3]);
-    }
-  }
-  ctx.stroke();
+  ctx.restore();
 }
 
 // ─── Crash Effect ─────────────────────────────────────────────
@@ -289,6 +308,12 @@ export function startGame(
   options: { display?: boolean; name?: string } = {},
 ): () => void {
   const display = options.display === true;
+  const statsScreen = display ? createStatsScreen(name => socket.send(JSON.stringify({ type: "start_session", name }))) : null;
+  const displaySettings = display ? createDisplaySettings(
+    (sessionId, patch) => socket.send(JSON.stringify({ type: "options", sessionId, ...patch })),
+    sessionId => socket.send(JSON.stringify({ type: "quit_session", sessionId })),
+    () => statsScreen?.hide(),
+  ) : null;
   const _ctx = canvas.getContext("2d");
   if (!_ctx) throw new Error("Canvas 2D context not supported");
   const ctx = _ctx;
@@ -302,12 +327,15 @@ export function startGame(
   let mapLines: MapLine[] = [];
   let mapSeed = 1;
   let gameStage = 1;
+  let activeSessionId: string | null = null;
   let myId = "";
   let mySlot = 0;
   const slotToId = new Map<number, string>();
   const idToSlot = new Map<string, number>();
   const idToColor = new Map<string, RGB>();
   const idToName = new Map<string, string>();
+  const idToPilot = new Map<string, string>();
+  let displayCamera: CameraState = { custom: null, followPilotId: null };
   let frameCount = 0;
   let lastTime = 0;
   let lastInputTime = 0;
@@ -315,10 +343,13 @@ export function startGame(
   let endgameStartTime = 0;
   let endgameActive = false;
   let connected = false;
+  let superseded = false;
   let animationId = 0;
   let myScore = 0;
   let myFuel = myLander.fuel;
   let roundStartTime = 0;
+  let revealStartTime = 0;
+  let revealDuration = 0;
   const isMobile = window.matchMedia("(pointer: coarse)").matches;
 
   // Track last sent input to only send on change
@@ -342,6 +373,24 @@ export function startGame(
   const keysDown = new Set<string>();
 
   function onKeyDown(e: KeyboardEvent): void {
+    if (display) {
+      if (e.target instanceof Element && e.target.closest("input:not([type=checkbox]), textarea, select, [contenteditable]")) return;
+      if (!e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "q" && activeSessionId) {
+        e.preventDefault();
+        socket.send(JSON.stringify({ type: "quit_session", sessionId: activeSessionId }));
+      }
+      if (!e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        displaySettings?.hide();
+        statsScreen?.toggle();
+      }
+      if (!e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        displaySettings?.toggle();
+      }
+      if (e.key === "Escape") { statsScreen?.hide(); displaySettings?.hide(); }
+      return;
+    }
     keysDown.add(e.key);
     if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) {
       e.preventDefault();
@@ -351,10 +400,8 @@ export function startGame(
     keysDown.delete(e.key);
   }
 
-  if (!display) {
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-  }
+  window.addEventListener("keydown", onKeyDown);
+  if (!display) window.addEventListener("keyup", onKeyUp);
 
   // Touch input
   let activeTouches: { x: number; y: number }[] = [];
@@ -391,11 +438,19 @@ export function startGame(
     .catch(() => {});
 
   // ── Network ──
+  let pilotId: string = crypto.randomUUID();
+  if (!display) {
+    try {
+      const savedId = localStorage.getItem("lunar-pilot-id");
+      if (savedId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(savedId)) pilotId = savedId;
+      localStorage.setItem("lunar-pilot-id", pilotId);
+    } catch { /* Browser storage is optional. */ }
+  }
   const socket = new PartySocket({
     host: workerHost,
     party: "game-server",
     room: "main",
-    query: display ? { mode: "display" } : { name: normalizeName(options.name) || "Pilot" },
+    query: display ? { mode: "display" } : { name: normalizeName(options.name) || "Pilot", pilotId },
   });
 
   socket.binaryType = "arraybuffer";
@@ -403,8 +458,12 @@ export function startGame(
   socket.addEventListener("open", () => {
     connected = true;
   });
-  socket.addEventListener("close", () => {
+  socket.addEventListener("close", (event) => {
     connected = false;
+    if ((event as CloseEvent).code === 4001) {
+      superseded = true;
+      socket.close();
+    }
   });
 
   socket.addEventListener("message", (e) => {
@@ -471,7 +530,25 @@ export function startGame(
     }
 
     switch (data.type) {
+      case "camera":
+        displayCamera = data.camera;
+        break;
+      case "superseded":
+        superseded = true;
+        connected = false;
+        socket.close();
+        break;
+      case "stats":
+        activeSessionId = data.stats?.id ?? null;
+        statsScreen?.update(data.stats);
+        displaySettings?.update(data.stats);
+        break;
       case "init":
+        displayCamera = data.camera;
+        idToPilot.clear();
+        activeSessionId = data.stats?.id ?? null;
+        statsScreen?.update(data.stats);
+        displaySettings?.update(data.stats);
         landings = [];
         approachIds.clear();
         landingHolds.clear();
@@ -481,12 +558,14 @@ export function startGame(
         myId = data.id;
         myColor = data.color;
         mySlot = data.slot;
-        myLander = createDefaultLander(myColor);
+        myLander = data.self?.lander ?? createDefaultLander(myColor);
         serverMyLander = { ...myLander };
         mapSeed = data.seed;
         gameStage = data.stage;
+        revealStartTime = performance.now();
+        revealDuration = data.revealMs;
         mapLines = generateTerrain(mapSeed);
-        myScore = 0;
+        myScore = data.self?.score ?? 0;
         myFuel = myLander.fuel;
         roundStartTime = performance.now();
         remoteLanders.clear();
@@ -509,12 +588,14 @@ export function startGame(
           slotToId.set(slot, id);
           idToSlot.set(id, slot);
           idToColor.set(id, color);
+          idToPilot.set(id, player.pilotId);
           idToName.set(id, player.name ?? "Pilot");
         }
         lastServerTime = performance.now();
         break;
 
       case "player_join":
+        idToPilot.set(data.id, data.pilotId);
         remoteLanders.set(data.id, createDefaultLander(data.color));
         slotToId.set(data.slot, data.id);
         idToSlot.set(data.id, data.slot);
@@ -530,6 +611,7 @@ export function startGame(
         idToSlot.delete(data.id);
         idToColor.delete(data.id);
         idToName.delete(data.id);
+        idToPilot.delete(data.id);
         break;
       }
 
@@ -540,7 +622,9 @@ export function startGame(
         displayCameras.clear();
         mapSeed = data.seed;
         mapLines = generateTerrain(mapSeed);
-        gameStage = 0;
+        gameStage = 2;
+        revealStartTime = performance.now();
+        revealDuration = data.revealMs;
         myLander = createDefaultLander(myColor);
         serverMyLander = { ...myLander };
         myFuel = myLander.fuel;
@@ -564,6 +648,10 @@ export function startGame(
         break;
 
       case "stage":
+        if (data.stage === 0) {
+          roundStartTime = performance.now();
+          lastServerTime = performance.now();
+        }
         gameStage = data.stage;
         break;
 
@@ -643,7 +731,7 @@ export function startGame(
       keysDown.has("ArrowUp") || keysDown.has("w") || keysDown.has("W") || foundCT ? 1 : 0;
 
     // Send input to server when it changes, or at minimum interval
-    if (!display && gameStage === 0 && myLander.a === 0) {
+    if (!display && !superseded && gameStage === 0 && myLander.a === 0) {
       const changed = thrust !== lastSentThrust || rotation !== lastSentRotation;
       if (changed || time - lastInputTime >= INPUT_INTERVAL) {
         lastInputTime = time;
@@ -708,9 +796,13 @@ export function startGame(
 
     function drawWorld(camS: number): void {
       const drawScale = (camS * dpr) / baseDpr;
-      drawTerrain(ctx, mapLines, drawScale, -1);
-      drawTerrain(ctx, mapLines, drawScale, 0);
-      drawTerrain(ctx, mapLines, drawScale, 1);
+      const progress = gameStage === 2 && !reducedMotion.matches
+        ? Math.min(1, (time - revealStartTime) / Math.max(1, revealDuration))
+        : 1;
+      drawTerrain(ctx, mapLines, drawScale, -1, progress);
+      drawTerrain(ctx, mapLines, drawScale, 0, progress);
+      drawTerrain(ctx, mapLines, drawScale, 1, progress);
+      if (gameStage === 2) return;
       const offsets = display ? [-MAP_WIDTH, 0, MAP_WIDTH] : [0];
       for (const offset of offsets) {
         ctx.save();
@@ -766,17 +858,20 @@ export function startGame(
       }
       // Stable player order keeps each approach in the same panel across updates.
       ships.sort((a, b) => (idToSlot.get(a.id) ?? 0) - (idToSlot.get(b.id) ?? 0));
-      const groups = groupApproaches(ships, mapLines, w, h);
+      const followed = Array.from(remoteLanders, ([id, lander]) => ({ id, lander }))
+        .find(ship => idToPilot.get(ship.id) === displayCamera.followPilotId);
+      const groups = cameraGroups(ships, followed, mapLines, w, h);
       const viewports = displayViewports(Math.max(1, groups.length), w, h);
       const nextCameras = new Map<string, { x: number; y: number; scale: number }>();
       for (let i = 0; i < viewports.length; i++) {
         const viewport = viewports[i];
         const group = groups[i];
+        const highFollow = followed && followed.lander.y - getTerrainHeightAt(followed.lander.x, mapLines) > 250;
         const bounds = group
-          ? approachBounds(group, mapLines)
+          ? highFollow ? { x: followed.lander.x, y: followed.lander.y, width: 400, height: 300 } : approachBounds(group, mapLines)
           : {
-              x: MAP_WIDTH / 2,
-              y: (worldTop + worldBottom) / 2,
+              x: displayCamera.custom?.x ?? MAP_WIDTH / 2,
+              y: displayCamera.custom?.y ?? (worldTop + worldBottom) / 2,
               width: MAP_WIDTH,
               height: worldTop - worldBottom,
             };
@@ -790,7 +885,7 @@ export function startGame(
                 (viewport.height - 100) / bounds.height,
               ),
             )
-          : fleetScale;
+          : fleetScale * (displayCamera.custom?.zoom ?? 1);
         // New panels begin centered on their ships; existing panels track smoothly.
         const previous =
           displayCameras.get(key) ??
@@ -821,7 +916,7 @@ export function startGame(
           ctx.font = `${isMobile ? 14 : 20}px 'PixelHackers', monospace`;
           for (let j = 0; j < group.length; j++) {
             const { id, lander } = group[j];
-            const label = `${idToName.get(id) ?? "Pilot"} ${lander.a === 1 ? "LANDED" : "APPROACHING"}`;
+            const label = `${idToName.get(id) ?? "Pilot"} ${followed ? "FOLLOWING" : lander.a === 1 ? "LANDED" : "APPROACHING"}`;
             const labelY = viewport.y + 28 + j * 26;
             ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
             ctx.fillRect(viewport.x, labelY - 24, viewport.width, 26);
@@ -870,7 +965,7 @@ export function startGame(
         ctx.translate(camX, camY);
       } else {
         const dim = Math.min(w, h);
-        camS = dim / 2 / 600;
+        camS = Math.min((w - 32) / MAP_WIDTH, (h - 160) / 1400);
 
         ctx.translate(w / 2, h / 2);
         ctx.scale(camS, camS);
@@ -957,6 +1052,13 @@ export function startGame(
       ctx.fillText(`NEW ROUND: ${remaining.toFixed(1)}`, w / 2, h / 3 + (isMobile ? 48 : 64));
     }
 
+    if (gameStage === 2) {
+      ctx.textAlign = "center";
+      ctx.font = `${isMobile ? 16 : 24}px 'PixelHackers', monospace`;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText("MAPPING LANDING ZONE", w / 2, hudLine);
+    }
+
     if (gameStage === 1) {
       ctx.textAlign = "center";
       ctx.font = `${isMobile ? 24 : 36}px 'PixelHackers', monospace`;
@@ -969,7 +1071,7 @@ export function startGame(
       ctx.textAlign = "center";
       ctx.font = `${isMobile ? 16 : 24}px 'PixelHackers', monospace`;
       ctx.fillStyle = "#ff5050";
-      ctx.fillText("CONNECTING...", w / 2, h - (isMobile ? 16 : 32));
+      ctx.fillText(superseded ? "SHIP ACTIVE IN ANOTHER TAB" : "CONNECTING...", w / 2, h - (isMobile ? 16 : 32));
     }
 
     ctx.restore(); // dpr scale
@@ -979,6 +1081,8 @@ export function startGame(
 
   // ── Cleanup ──
   return () => {
+    displaySettings?.destroy();
+    statsScreen?.destroy();
     cancelAnimationFrame(animationId);
     socket.close();
     window.removeEventListener("resize", resize);
