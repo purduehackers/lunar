@@ -59,7 +59,35 @@ const { display = false } = Astro.props;
       .name-entry[hidden] {
         display: none;
       }
-      .name-entry h1 {
+      .name-entry .game-title {
+        margin-bottom: 20px;
+        color: #fff;
+        font-size: clamp(32px, 7vw, 72px);
+        font-weight: normal;
+        line-height: 1.25;
+        letter-spacing: -0.04em;
+        text-align: center;
+        text-transform: uppercase;
+        text-shadow:
+          1px 1px 0 #ccc,
+          2px 2px 0 #ccc,
+          3px 3px 0 #999,
+          4px 4px 0 #999,
+          5px 5px 0 #666,
+          6px 6px 0 #666,
+          7px 7px 0 #333,
+          8px 8px 0 #333;
+      }
+      @media (max-width: 600px) {
+        .name-entry {
+          grid-template-columns: minmax(0, 420px);
+        }
+        .name-entry .game-title {
+          font-size: clamp(40px, 12vw, 64px);
+          text-wrap: balance;
+        }
+      }
+      .name-entry h2 {
         font-size: clamp(24px, 5vw, 40px);
         font-weight: normal;
       }
@@ -122,7 +150,8 @@ const { display = false } = Astro.props;
     <canvas id="game" data-display={display ? "true" : "false"}></canvas>
     {!display && (
       <form id="name-entry" class="name-entry">
-        <h1>READY TO LAND?</h1>
+        <h1 class="game-title">Lunar Lander</h1>
+        <h2>READY TO LAND?</h2>
         <label for="player-name">ENTER YOUR NAME</label>
         <input id="player-name" name="name" type="text" autocomplete="nickname" maxlength="24" required />
         <button type="submit">LAUNCH</button>
