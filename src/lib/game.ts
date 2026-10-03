@@ -1,5 +1,5 @@
 import PartySocket from "partysocket";
-import { shipColorName } from "./colors";
+import { normalizeName } from "./names";
 import { approachBounds, groupApproaches, displayViewports, wrappedDistance } from "./display";
 import {
   type RGB,
@@ -47,6 +47,7 @@ type ServerMessage =
   | {
       type: "init";
       id: string;
+      name?: string;
       color: RGB;
       slot: number;
       seed: number;
@@ -66,10 +67,11 @@ type ServerMessage =
           score: number;
           color: RGB;
           slot: number;
+          name?: string;
         }
       >;
     }
-  | { type: "player_join"; id: string; color: RGB; slot: number }
+  | { type: "player_join"; id: string; color: RGB; slot: number; name?: string }
   | { type: "player_leave"; id: string }
   | { type: "new_round"; seed: number }
   | { type: "stage"; stage: number }
@@ -284,7 +286,7 @@ function drawArcadeBtn(
 export function startGame(
   canvas: HTMLCanvasElement,
   workerHost: string,
-  options: { display?: boolean } = {},
+  options: { display?: boolean; name?: string } = {},
 ): () => void {
   const display = options.display === true;
   const _ctx = canvas.getContext("2d");
@@ -305,6 +307,7 @@ export function startGame(
   const slotToId = new Map<number, string>();
   const idToSlot = new Map<string, number>();
   const idToColor = new Map<string, RGB>();
+  const idToName = new Map<string, string>();
   let frameCount = 0;
   let lastTime = 0;
   let lastInputTime = 0;
@@ -327,7 +330,7 @@ export function startGame(
   const approachIds = new Set<string>();
   const landingHolds = new Map<string, number>();
   let displayCameras = new Map<string, { x: number; y: number; scale: number }>();
-  let landings: { color: RGB; expires: number }[] = [];
+  let landings: { name: string; color: RGB; expires: number }[] = [];
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
   // Client-side interpolation: snapshot server state, extrapolate between ticks
@@ -392,7 +395,7 @@ export function startGame(
     host: workerHost,
     party: "game-server",
     room: "main",
-    query: display ? { mode: "display" } : {},
+    query: display ? { mode: "display" } : { name: normalizeName(options.name) || "Pilot" },
   });
 
   socket.binaryType = "arraybuffer";
@@ -431,7 +434,11 @@ export function startGame(
           };
           const previous = id === myId ? serverMyLander : remoteLanders.get(id);
           if (a === 1 && previous?.a === 0) {
-            landings.push({ color, expires: performance.now() + 5000 });
+            landings.push({
+              name: idToName.get(id) ?? "Pilot",
+              color,
+              expires: performance.now() + 5000,
+            });
             landings = landings.slice(-3);
             if (approachIds.has(id)) landingHolds.set(id, performance.now() + 3000);
           }
@@ -487,10 +494,12 @@ export function startGame(
         slotToId.clear();
         idToSlot.clear();
         idToColor.clear();
+        idToName.clear();
         if (!display) {
           slotToId.set(mySlot, myId);
           idToSlot.set(myId, mySlot);
           idToColor.set(myId, myColor);
+          idToName.set(myId, data.name ?? (normalizeName(options.name) || "Pilot"));
         }
         for (const [id, player] of Object.entries(data.players)) {
           const { x, y, r, vx, vy, vr, t, a, fuel, color, slot } = player;
@@ -500,6 +509,7 @@ export function startGame(
           slotToId.set(slot, id);
           idToSlot.set(id, slot);
           idToColor.set(id, color);
+          idToName.set(id, player.name ?? "Pilot");
         }
         lastServerTime = performance.now();
         break;
@@ -509,6 +519,7 @@ export function startGame(
         slotToId.set(data.slot, data.id);
         idToSlot.set(data.id, data.slot);
         idToColor.set(data.id, data.color);
+        idToName.set(data.id, data.name ?? "Pilot");
         break;
 
       case "player_leave": {
@@ -518,6 +529,7 @@ export function startGame(
         if (leftSlot !== undefined) slotToId.delete(leftSlot);
         idToSlot.delete(data.id);
         idToColor.delete(data.id);
+        idToName.delete(data.id);
         break;
       }
 
@@ -679,6 +691,21 @@ export function startGame(
       return crash.time < 1000;
     });
 
+    function drawName(lander: Lander, name: string, camS: number): void {
+      // Counter-scale the label so it remains upright and readable at every zoom level.
+      ctx.save();
+      ctx.translate(lander.x, -lander.y);
+      ctx.scale(1 / camS, 1 / camS);
+      ctx.font = `${isMobile ? 12 : 16}px 'PixelHackers', monospace`;
+      ctx.textAlign = "center";
+      const width = ctx.measureText(name).width;
+      ctx.fillStyle = "rgba(0, 0, 0, 0.8)";
+      ctx.fillRect(-width / 2 - 4, -camS * 24 - 36, width + 8, 24);
+      ctx.fillStyle = `rgb(${lander.color.join(",")})`;
+      ctx.fillText(name, 0, -camS * 24 - 18);
+      ctx.restore();
+    }
+
     function drawWorld(camS: number): void {
       const drawScale = (camS * dpr) / baseDpr;
       drawTerrain(ctx, mapLines, drawScale, -1);
@@ -689,13 +716,18 @@ export function startGame(
         ctx.save();
         ctx.translate(offset, 0);
         for (const grave of graves) drawGrave(ctx, grave, drawScale);
-        for (const lander of remoteLanders.values()) {
-          if (lander.a !== 2) drawShip(ctx, lander, drawScale, frameCount);
+        for (const [id, lander] of remoteLanders) {
+          if (lander.a === 2) continue;
+          drawShip(ctx, lander, drawScale, frameCount);
+          drawName(lander, idToName.get(id) ?? "Pilot", camS);
         }
         for (const crash of crashes) drawCrashEffect(ctx, crash, drawScale);
         ctx.restore();
       }
-      if (!display && myLander.a !== 2) drawShip(ctx, myLander, drawScale, frameCount);
+      if (!display && myLander.a !== 2) {
+        drawShip(ctx, myLander, drawScale, frameCount);
+        drawName(myLander, idToName.get(myId) ?? "Pilot", camS);
+      }
     }
 
     if (display) {
@@ -788,8 +820,8 @@ export function startGame(
           ctx.textAlign = "center";
           ctx.font = `${isMobile ? 14 : 20}px 'PixelHackers', monospace`;
           for (let j = 0; j < group.length; j++) {
-            const { lander } = group[j];
-            const label = `${shipColorName(lander.color)} ${lander.a === 1 ? "LANDED" : "APPROACHING"}`;
+            const { id, lander } = group[j];
+            const label = `${idToName.get(id) ?? "Pilot"} ${lander.a === 1 ? "LANDED" : "APPROACHING"}`;
             const labelY = viewport.y + 28 + j * 26;
             ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
             ctx.fillRect(viewport.x, labelY - 24, viewport.width, 26);
@@ -895,7 +927,7 @@ export function startGame(
     ctx.font = `${isMobile ? 18 : 28}px 'PixelHackers', monospace`;
     for (let i = 0; i < landings.length; i++) {
       const landing = landings[i];
-      const message = `${shipColorName(landing.color)} LANDED!`;
+      const message = `${landing.name} LANDED!`;
       const y = (display ? h - 32 : h * 0.7) - (landings.length - 1 - i) * 40;
       const width = Math.min(ctx.measureText(message).width, Math.max(1, w - 32));
       ctx.fillStyle = "rgba(0, 0, 0, 0.85)";

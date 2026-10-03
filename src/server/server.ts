@@ -22,6 +22,7 @@ import {
   hasStateChanged,
 } from "../lib/protocol";
 
+import { normalizeName } from "../lib/names";
 import { SHIP_COLORS } from "../lib/colors";
 
 const COLORS = SHIP_COLORS.map((ship) => ship.color);
@@ -41,6 +42,7 @@ type ClientMessage = {
 };
 
 interface PlayerState {
+  name: string;
   lander: Lander;
   lastInput: PlayerInput;
   color: RGB;
@@ -185,7 +187,9 @@ export class GameServer extends Server<Env> {
   // ── Connection Lifecycle ─────────────────────────────────────
 
   onConnect(connection: Connection, context: { request: Request }): void {
-    const spectator = new URL(context.request.url).searchParams.get("mode") === "display";
+    const query = new URL(context.request.url).searchParams;
+    const spectator = query.get("mode") === "display";
+    const name = normalizeName(query.get("name")) || "Pilot";
     const color: RGB = spectator ? [255, 255, 255] : COLORS[this.colorIndex % COLORS.length];
     if (!spectator) this.colorIndex++;
     const slot = spectator ? -1 : this.allocSlot();
@@ -214,6 +218,7 @@ export class GameServer extends Server<Env> {
     // Register the new player before building the init payload
     if (!spectator)
       this.players.set(connection.id, {
+        name,
         lander: createDefaultLander(color),
         lastInput: { thrust: 0, rotation: 0, seq: 0 },
         color,
@@ -237,6 +242,7 @@ export class GameServer extends Server<Env> {
         score: number;
         color: RGB;
         slot: number;
+        name: string;
       }
     > = {};
     for (const [id, ps] of this.players) {
@@ -254,6 +260,7 @@ export class GameServer extends Server<Env> {
         score: ps.score,
         color: ps.color,
         slot: ps.slot,
+        name: ps.name,
       };
     }
 
@@ -262,6 +269,7 @@ export class GameServer extends Server<Env> {
       JSON.stringify({
         type: "init",
         id: connection.id,
+        name,
         color,
         slot,
         seed: this.seed,
@@ -271,9 +279,10 @@ export class GameServer extends Server<Env> {
     );
 
     if (!spectator)
-      this.broadcast(JSON.stringify({ type: "player_join", id: connection.id, color, slot }), [
-        connection.id,
-      ]);
+      this.broadcast(
+        JSON.stringify({ type: "player_join", id: connection.id, name, color, slot }),
+        [connection.id],
+      );
 
     if (wasWaiting) {
       // Notify existing players about the new round (new player already has correct data)
