@@ -44,10 +44,48 @@ const { display = false } = Astro.props;
       canvas {
         display: block;
       }
+      .join-qr {
+        position: fixed;
+        top: max(16px, env(safe-area-inset-top));
+        right: max(16px, env(safe-area-inset-right));
+        z-index: 1;
+        width: clamp(112px, 18vmin, 176px);
+        color: #fff;
+        background: #000;
+        text-decoration: none;
+        text-align: center;
+      }
+      .join-qr img {
+        display: block;
+        width: 100%;
+        height: auto;
+        background: #fff;
+      }
+      .join-qr span {
+        display: block;
+        padding: 10px 4px;
+        font: 12px "PixelHackers", monospace;
+      }
+      .join-qr:focus-visible {
+        outline: 2px solid #fff;
+        outline-offset: 4px;
+      }
     </style>
   </head>
   <body>
     <canvas id="game" data-display={display ? "true" : "false"}></canvas>
+    {display && (
+      <a
+        class="join-qr"
+        href="https://lunar.purduehackers.com"
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="Join Lunar Lander at lunar.purduehackers.com"
+      >
+        <img src="/join-qr.svg" alt="QR code linking to lunar.purduehackers.com" width="176" height="176" />
+        <span>SCAN TO PLAY</span>
+      </a>
+    )}
     <script>
       import { startGame } from "../lib/game";
 
