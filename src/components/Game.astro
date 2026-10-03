@@ -44,6 +44,52 @@ const { display = false } = Astro.props;
       canvas {
         display: block;
       }
+      .name-entry {
+        position: fixed;
+        inset: 0;
+        z-index: 2;
+        display: grid;
+        place-content: center;
+        gap: 24px;
+        padding: 24px;
+        background: #000;
+        color: #fff;
+        font-family: "PixelHackers", monospace;
+      }
+      .name-entry[hidden] {
+        display: none;
+      }
+      .name-entry h1 {
+        font-size: clamp(24px, 5vw, 40px);
+        font-weight: normal;
+      }
+      .name-entry label {
+        font-size: 16px;
+      }
+      .name-entry input,
+      .name-entry button {
+        width: min(100%, 420px);
+        min-height: 52px;
+        padding: 14px 16px;
+        border: 2px solid #fff;
+        border-radius: 0;
+        font: 20px "PixelHackers", monospace;
+        touch-action: manipulation;
+      }
+      .name-entry input {
+        background: #000;
+        color: #fff;
+      }
+      .name-entry button {
+        background: #fff;
+        color: #000;
+        cursor: pointer;
+      }
+      .name-entry input:focus-visible,
+      .name-entry button:focus-visible {
+        outline: 2px solid #00ff64;
+        outline-offset: 4px;
+      }
       .join-qr {
         position: fixed;
         top: max(16px, env(safe-area-inset-top));
@@ -74,6 +120,14 @@ const { display = false } = Astro.props;
   </head>
   <body>
     <canvas id="game" data-display={display ? "true" : "false"}></canvas>
+    {!display && (
+      <form id="name-entry" class="name-entry">
+        <h1>READY TO LAND?</h1>
+        <label for="player-name">ENTER YOUR NAME</label>
+        <input id="player-name" name="name" type="text" autocomplete="nickname" maxlength="24" required />
+        <button type="submit">LAUNCH</button>
+      </form>
+    )}
     {display && (
       <a
         class="join-qr"
@@ -87,10 +141,11 @@ const { display = false } = Astro.props;
       </a>
     )}
     <script>
-      import { startGame } from "../lib/game";
+      import { startExperience } from "../lib/experience";
 
       const canvas = document.getElementById("game") as HTMLCanvasElement;
-      startGame(canvas, window.location.host, { display: canvas.dataset.display === "true" });
+      const form = document.getElementById("name-entry") as HTMLFormElement | null;
+      startExperience(canvas, window.location.host, form);
     </script>
   </body>
 </html>
