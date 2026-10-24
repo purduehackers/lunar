@@ -42,14 +42,15 @@ export function unpackState(flags: number): number {
 
 // ─── World Update ────────────────────────────────────────────
 
-export function encodeWorldUpdate(players: BinaryPlayerEntry[]): ArrayBuffer {
+export function encodeWorldUpdate(roundId: number, players: BinaryPlayerEntry[]): ArrayBuffer {
   const count = Math.min(players.length, 255);
-  const buf = new ArrayBuffer(2 + PLAYER_BYTE_SIZE * count);
+  const buf = new ArrayBuffer(6 + PLAYER_BYTE_SIZE * count);
   const view = new DataView(buf);
   view.setUint8(0, MSG_WORLD);
   view.setUint8(1, count);
+  view.setUint32(2, roundId);
 
-  let offset = 2;
+  let offset = 6;
   for (let i = 0; i < count; i++) {
     const p = players[i];
     view.setUint8(offset, p.slot);
@@ -68,14 +69,14 @@ export function encodeWorldUpdate(players: BinaryPlayerEntry[]): ArrayBuffer {
   return buf;
 }
 
-export function decodeWorldUpdate(buf: ArrayBuffer): BinaryPlayerEntry[] {
-  if (buf.byteLength < 2) return [];
+export function decodeWorldUpdate(buf: ArrayBuffer): { roundId: number; players: BinaryPlayerEntry[] } | null {
+  if (buf.byteLength < 6) return null;
   const view = new DataView(buf);
   const count = view.getUint8(1);
-  if (buf.byteLength < 2 + count * PLAYER_BYTE_SIZE) return [];
+  if (buf.byteLength !== 6 + count * PLAYER_BYTE_SIZE) return null;
   const players: BinaryPlayerEntry[] = [];
 
-  let offset = 2;
+  let offset = 6;
   for (let i = 0; i < count; i++) {
     players.push({
       slot: view.getUint8(offset),
@@ -92,14 +93,14 @@ export function decodeWorldUpdate(buf: ArrayBuffer): BinaryPlayerEntry[] {
     offset += PLAYER_BYTE_SIZE;
   }
 
-  return players;
+  return { roundId: view.getUint32(2), players };
 }
 
 // ─── Crash Event ─────────────────────────────────────────────
-// 12 bytes: type(1) + x(4) + y(4) + r(1) + g(1) + b(1)
+// 17 bytes: type(1) + x(4) + y(4) + rgb(3) + roundId(4) + slot(1)
 
-export function encodeCrash(x: number, y: number, color: [number, number, number]): ArrayBuffer {
-  const buf = new ArrayBuffer(12);
+export function encodeCrash(roundId: number, slot: number, x: number, y: number, color: [number, number, number]): ArrayBuffer {
+  const buf = new ArrayBuffer(17);
   const view = new DataView(buf);
   view.setUint8(0, MSG_CRASH);
   view.setFloat32(1, x);
@@ -107,13 +108,17 @@ export function encodeCrash(x: number, y: number, color: [number, number, number
   view.setUint8(9, color[0]);
   view.setUint8(10, color[1]);
   view.setUint8(11, color[2]);
+  view.setUint32(12, roundId);
+  view.setUint8(16, slot);
   return buf;
 }
 
-export function decodeCrash(buf: ArrayBuffer): { x: number; y: number; color: [number, number, number] } | null {
-  if (buf.byteLength < 12) return null;
+export function decodeCrash(buf: ArrayBuffer): { roundId: number; slot: number; x: number; y: number; color: [number, number, number] } | null {
+  if (buf.byteLength !== 17) return null;
   const view = new DataView(buf);
   return {
+    roundId: view.getUint32(12),
+    slot: view.getUint8(16),
     x: view.getFloat32(1),
     y: view.getFloat32(5),
     color: [view.getUint8(9), view.getUint8(10), view.getUint8(11)],

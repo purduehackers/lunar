@@ -2,7 +2,12 @@ import { createDisplaySettings } from "./display-settings-screen";
 import type { CameraState } from "./camera";
 import { createStatsScreen } from "./stats-screen";
 import type { SessionStats } from "./session-stats";
+import type { PlaySchedule } from "./play-schedule";
+import { createPlayScheduleScreen } from "./play-schedule-screen";
 import PartySocket from "partysocket";
+import { LocalFlight, FLIGHT_TICK_MS, MAX_FRAME_GAP_MS } from "./flight";
+import { reportedLander } from "./flight-protocol";
+import { RemoteLander } from "./remote-lander";
 import { normalizeName } from "./names";
 import { approachBounds, cameraGroups, displayViewports, wrappedDistance } from "./display";
 import {
@@ -27,9 +32,7 @@ import {
 // ─── Constants ────────────────────────────────────────────────
 
 const MAX_ZOOM = 4;
-const INPUT_INTERVAL = 50; // ms between input sends
 const MAX_DT = 0.1; // cap delta-time to prevent physics explosions
-const MAX_EXTRAPOLATION = 0.15; // max seconds to extrapolate beyond last server tick
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -51,8 +54,13 @@ type ServerMessage =
   | {
       type: "init";
       camera: CameraState;
-      self: { lander: Lander; score: number } | null;
+      self: { lander: Lander; score: number; elapsedMs: number } | null;
+      roundId: number;
+      epoch: number;
+      authority: string | null;
+      endgameMs: number;
       stats: SessionStats | null;
+      playSchedule: PlaySchedule | null;
       id: string;
       name?: string;
       color: RGB;
@@ -82,13 +90,15 @@ type ServerMessage =
     }
   | { type: "superseded" }
   | { type: "stats"; stats: SessionStats | null }
+  | { type: "play_schedule"; schedule: PlaySchedule | null; epoch: number }
   | { type: "camera"; camera: CameraState }
-  | { type: "player_join"; id: string; pilotId: string; color: RGB; slot: number; name?: string }
+  | { type: "player_join"; id: string; pilotId: string; color: RGB; slot: number; name?: string; lander: Lander }
   | { type: "player_leave"; id: string }
-  | { type: "new_round"; seed: number; revealMs: number }
-  | { type: "stage"; stage: number }
-  | { type: "endgame_start" }
-  | { type: "endgame_cancel" };
+  | { type: "new_round"; roundId: number; seed: number; revealMs: number }
+  | { type: "stage"; roundId: number; stage: number }
+  | { type: "endgame_start"; roundId: number }
+  | { type: "endgame_cancel"; roundId: number }
+  | { type: "result_ack"; roundId: number; authority: string; score: number };
 
 // ─── Ship Rendering ──────────────────────────────────────────
 
@@ -309,6 +319,7 @@ export function startGame(
 ): () => void {
   const display = options.display === true;
   const statsScreen = display ? createStatsScreen(name => socket.send(JSON.stringify({ type: "start_session", name }))) : null;
+  const scheduleScreen = createPlayScheduleScreen(display);
   const displaySettings = display ? createDisplaySettings(
     (sessionId, patch) => socket.send(JSON.stringify({ type: "options", sessionId, ...patch })),
     sessionId => socket.send(JSON.stringify({ type: "quit_session", sessionId })),
@@ -320,7 +331,12 @@ export function startGame(
 
   // ── State ──
   let myColor: RGB = [255, 255, 255];
-  let myLander = createDefaultLander(myColor);
+  let localFlight = new LocalFlight(createDefaultLander(myColor));
+  let myLander = localFlight.render();
+  let roundId = 0;
+  let epoch = 0;
+  let authority: string | null = null;
+  let resultPending = false;
   const remoteLanders = new Map<string, Lander>();
   let crashes: CrashEffect[] = [];
   let graves: Grave[] = [];
@@ -338,8 +354,8 @@ export function startGame(
   let displayCamera: CameraState = { custom: null, followPilotId: null };
   let frameCount = 0;
   let lastTime = 0;
-  let lastInputTime = 0;
-  let inputSeq = 0;
+  let lastStateTime = 0;
+  let stateSeq = 0;
   let endgameStartTime = 0;
   let endgameActive = false;
   let connected = false;
@@ -350,11 +366,8 @@ export function startGame(
   let roundStartTime = 0;
   let revealStartTime = 0;
   let revealDuration = 0;
+  let pausedAt: number | null = null;
   const isMobile = window.matchMedia("(pointer: coarse)").matches;
-
-  // Track last sent input to only send on change
-  let lastSentThrust: 0 | 1 = 0;
-  let lastSentRotation: -1 | 0 | 1 = 0;
 
   // Smooth camera zoom
   let smoothCamS = 0;
@@ -364,10 +377,7 @@ export function startGame(
   let landings: { name: string; color: RGB; expires: number }[] = [];
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
-  // Client-side interpolation: snapshot server state, extrapolate between ticks
-  let serverMyLander: Lander = { ...myLander };
-  const serverRemoteLanders = new Map<string, Lander>();
-  let lastServerTime = 0;
+  const remoteViews = new Map<string, RemoteLander>();
 
   // ── Input ──
   const keysDown = new Set<string>();
@@ -391,6 +401,7 @@ export function startGame(
       if (e.key === "Escape") { statsScreen?.hide(); displaySettings?.hide(); }
       return;
     }
+    if (pausedAt !== null || !connected || superseded) return;
     keysDown.add(e.key);
     if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) {
       e.preventDefault();
@@ -407,7 +418,7 @@ export function startGame(
   let activeTouches: { x: number; y: number }[] = [];
   function handleTouch(e: TouchEvent): void {
     e.preventDefault();
-    activeTouches = Array.from(e.touches).map((t) => ({ x: t.clientX, y: t.clientY }));
+    activeTouches = pausedAt !== null ? [] : Array.from(e.touches).map((t) => ({ x: t.clientX, y: t.clientY }));
   }
   if (!display) {
     canvas.addEventListener("touchstart", handleTouch);
@@ -450,32 +461,56 @@ export function startGame(
     host: workerHost,
     party: "game-server",
     room: "main",
+    maxEnqueuedMessages: 0,
     query: display ? { mode: "display" } : { name: normalizeName(options.name) || "Pilot", pilotId },
   });
 
   socket.binaryType = "arraybuffer";
 
   socket.addEventListener("open", () => {
-    connected = true;
+    // Wait for init before sending any state on a new transport.
+    connected = false;
   });
   socket.addEventListener("close", (event) => {
     connected = false;
+    clearControls();
+    localFlight.freeze();
     if ((event as CloseEvent).code === 4001) {
       superseded = true;
       socket.close();
     }
   });
 
+  function updatePlaySchedule(schedule: PlaySchedule | null): void {
+    const now = performance.now();
+    if (schedule?.phase === "paused" && pausedAt === null) {
+      pausedAt = now;
+      keysDown.clear();
+      activeTouches = [];
+      localFlight.freeze();
+    } else if (schedule?.phase !== "paused" && pausedAt !== null) {
+      const duration = now - pausedAt;
+      roundStartTime += duration;
+      revealStartTime += duration;
+      endgameStartTime += duration;
+      pausedAt = null;
+      lastTime = 0;
+      for (const view of remoteViews.values()) view.receivedAt = now;
+    }
+    lastTime = 0;
+    scheduleScreen.update(schedule);
+  }
+
   socket.addEventListener("message", (e) => {
     // Binary messages: world updates and crash events
     if (e.data instanceof ArrayBuffer) {
       const msgType = new Uint8Array(e.data)[0];
       if (msgType === MSG_WORLD) {
-        lastServerTime = performance.now();
-        const players = decodeWorldUpdate(e.data);
-        for (const p of players) {
+        const world = decodeWorldUpdate(e.data);
+        if (!connected || !world || world.roundId !== roundId) return;
+        for (const p of world.players) {
           const id = slotToId.get(p.slot);
-          if (!id) continue;
+          if (!id || id === myId) continue; // Never replace our own live simulation with an echo.
           const color = idToColor.get(id) ?? myColor;
           const t = unpackThrust(p.flags);
           const a = unpackState(p.flags);
@@ -491,7 +526,7 @@ export function startGame(
             fuel: p.fuel,
             color,
           };
-          const previous = id === myId ? serverMyLander : remoteLanders.get(id);
+          const previous = remoteViews.get(id)?.snapshot;
           if (a === 1 && previous?.a === 0) {
             landings.push({
               name: idToName.get(id) ?? "Pilot",
@@ -501,19 +536,14 @@ export function startGame(
             landings = landings.slice(-3);
             if (approachIds.has(id)) landingHolds.set(id, performance.now() + 3000);
           }
-          if (id === myId) {
-            serverMyLander = snap;
-            Object.assign(myLander, snap);
-            myFuel = p.fuel;
-            myScore = p.score;
-          } else {
-            serverRemoteLanders.set(id, snap);
-            remoteLanders.set(id, { ...snap });
-          }
+          const view = remoteViews.get(id);
+          if (view) view.receive(snap, performance.now());
+          else remoteViews.set(id, new RemoteLander(snap, performance.now()));
+          if (!view || a !== 0) remoteLanders.set(id, { ...snap });
         }
       } else if (msgType === MSG_CRASH) {
         const c = decodeCrash(e.data);
-        if (c) {
+        if (connected && c && c.roundId === roundId && c.slot !== mySlot) {
           crashes.push({ x: c.x, y: c.y, time: 0, color: c.color });
           graves.push({ x: c.x, y: c.y, color: c.color });
         }
@@ -529,13 +559,27 @@ export function startGame(
       return;
     }
 
+    if (!data || typeof data !== "object") return;
+    if (data.type !== "init" && !connected) return;
     switch (data.type) {
+      case "result_ack":
+        if (data.roundId === roundId && data.authority === authority) {
+          myScore = data.score;
+          resultPending = false;
+        }
+        break;
+      case "play_schedule":
+        epoch = data.epoch;
+        updatePlaySchedule(data.schedule);
+        break;
       case "camera":
         displayCamera = data.camera;
         break;
       case "superseded":
         superseded = true;
         connected = false;
+        clearControls();
+        localFlight.freeze();
         socket.close();
         break;
       case "stats":
@@ -544,6 +588,18 @@ export function startGame(
         displaySettings?.update(data.stats);
         break;
       case "init":
+        if (superseded) return;
+        connected = true;
+        roundId = data.roundId;
+        epoch = data.epoch;
+        authority = data.authority;
+        stateSeq = 0;
+        lastTime = 0;
+        lastStateTime = 0;
+        resultPending = false;
+        clearControls();
+        crashes = [];
+        graves = [];
         displayCamera = data.camera;
         idToPilot.clear();
         activeSessionId = data.stats?.id ?? null;
@@ -554,12 +610,13 @@ export function startGame(
         landingHolds.clear();
         displayCameras.clear();
         smoothCamS = 0;
-        endgameActive = false;
+        endgameActive = data.endgameMs > 0;
+        endgameStartTime = performance.now() - (6000 - data.endgameMs);
         myId = data.id;
         myColor = data.color;
         mySlot = data.slot;
-        myLander = data.self?.lander ?? createDefaultLander(myColor);
-        serverMyLander = { ...myLander };
+        localFlight = new LocalFlight(data.self?.lander ?? createDefaultLander(myColor), data.self?.elapsedMs ?? 0);
+        myLander = localFlight.render();
         mapSeed = data.seed;
         gameStage = data.stage;
         revealStartTime = performance.now();
@@ -569,7 +626,7 @@ export function startGame(
         myFuel = myLander.fuel;
         roundStartTime = performance.now();
         remoteLanders.clear();
-        serverRemoteLanders.clear();
+        remoteViews.clear();
         slotToId.clear();
         idToSlot.clear();
         idToColor.clear();
@@ -584,19 +641,22 @@ export function startGame(
           const { x, y, r, vx, vy, vr, t, a, fuel, color, slot } = player;
           const snap: Lander = { x, y, r, vx, vy, vr, t, a, fuel, color };
           remoteLanders.set(id, snap);
-          serverRemoteLanders.set(id, { ...snap });
+          remoteViews.set(id, new RemoteLander(snap, performance.now()));
           slotToId.set(slot, id);
           idToSlot.set(id, slot);
           idToColor.set(id, color);
           idToPilot.set(id, player.pilotId);
           idToName.set(id, player.name ?? "Pilot");
         }
-        lastServerTime = performance.now();
+        pausedAt = null;
+        updatePlaySchedule(data.playSchedule ?? null);
+        if (document.hidden && !display) suspendFlight();
         break;
 
       case "player_join":
         idToPilot.set(data.id, data.pilotId);
-        remoteLanders.set(data.id, createDefaultLander(data.color));
+        remoteLanders.set(data.id, { ...data.lander });
+        remoteViews.set(data.id, new RemoteLander(data.lander, performance.now()));
         slotToId.set(data.slot, data.id);
         idToSlot.set(data.id, data.slot);
         idToColor.set(data.id, data.color);
@@ -605,7 +665,7 @@ export function startGame(
 
       case "player_leave": {
         remoteLanders.delete(data.id);
-        serverRemoteLanders.delete(data.id);
+        remoteViews.delete(data.id);
         const leftSlot = idToSlot.get(data.id);
         if (leftSlot !== undefined) slotToId.delete(leftSlot);
         idToSlot.delete(data.id);
@@ -616,6 +676,11 @@ export function startGame(
       }
 
       case "new_round":
+        roundId = data.roundId;
+        stateSeq = 0;
+        resultPending = false;
+        lastTime = 0;
+        clearControls();
         landings = [];
         approachIds.clear();
         landingHolds.clear();
@@ -625,74 +690,98 @@ export function startGame(
         gameStage = 2;
         revealStartTime = performance.now();
         revealDuration = data.revealMs;
-        myLander = createDefaultLander(myColor);
-        serverMyLander = { ...myLander };
+        localFlight = new LocalFlight(createDefaultLander(myColor));
+        myLander = localFlight.render();
         myFuel = myLander.fuel;
         roundStartTime = performance.now();
         remoteLanders.clear();
-        serverRemoteLanders.clear();
+        remoteViews.clear();
         for (const [id, color] of idToColor) {
           if (id === myId) continue;
           const lander = createDefaultLander(color);
           remoteLanders.set(id, lander);
-          serverRemoteLanders.set(id, { ...lander });
+          remoteViews.set(id, new RemoteLander(lander, performance.now()));
         }
         crashes = [];
         graves = [];
         endgameActive = false;
         smoothCamS = 0;
-        lastSentThrust = 0;
-        lastSentRotation = 0;
-        inputSeq = 0;
-        lastServerTime = performance.now();
+        lastStateTime = 0;
         break;
 
       case "stage":
+        if (data.roundId !== roundId) break;
+        lastTime = 0;
+        localFlight.freeze();
         if (data.stage === 0) {
           roundStartTime = performance.now();
-          lastServerTime = performance.now();
+          for (const view of remoteViews.values()) view.receivedAt = performance.now();
         }
         gameStage = data.stage;
         break;
 
       case "endgame_start":
+        if (data.roundId !== roundId) break;
         endgameActive = true;
         endgameStartTime = performance.now();
         break;
 
       case "endgame_cancel":
+        if (data.roundId !== roundId) break;
         endgameActive = false;
         break;
     }
   });
 
-  // ── Visibility ──
+  function clearControls(): void {
+    keysDown.clear();
+    activeTouches = [];
+  }
+
+  function suspendFlight(): void {
+    if (display || superseded) return;
+    sendState();
+    if (connected && socket.readyState === 1) socket.send(JSON.stringify({ type: "suspend", authority }));
+    connected = false;
+    clearControls();
+    localFlight.freeze();
+    socket.close(); // Stop auto-retries until the browser is visible again.
+  }
+
   function onVisibilityChange(): void {
-    if (!document.hidden) {
-      lastTime = 0;
-    }
+    lastTime = 0;
+    if (display || superseded) return;
+    if (document.hidden) suspendFlight();
+    else socket.reconnect(); // Fresh init transfers only the server's accepted flight.
   }
   document.addEventListener("visibilitychange", onVisibilityChange);
+  window.addEventListener("blur", clearControls);
 
-  // ── Send Input ──
-  function sendInput(thrust: 0 | 1, rotation: -1 | 0 | 1): void {
-    inputSeq++;
-    lastSentThrust = thrust;
-    lastSentRotation = rotation;
-    socket.send(JSON.stringify({ type: "input", thrust, rotation, seq: inputSeq }));
+  function sendState(): void {
+    if (display || superseded || !connected || !authority || socket.readyState !== 1 ||
+      pausedAt !== null || gameStage !== 0 || (localFlight.lander.a !== 0 && !resultPending)) return;
+    socket.send(JSON.stringify({
+      type: "state", roundId, epoch, authority, seq: ++stateSeq,
+      lander: reportedLander(localFlight.lander), elapsedMs: localFlight.elapsedMs,
+      result: localFlight.result,
+    }));
   }
 
   // ── Game Loop ──
   function loop(time: number): void {
     animationId = requestAnimationFrame(loop);
 
-    const rawDt = Math.min(lastTime === 0 ? 0.016 : (time - lastTime) / 1000, MAX_DT);
+    const frameMs = lastTime === 0 ? 0 : time - lastTime;
+    const rawDt = Math.min(frameMs / 1000, MAX_DT);
     lastTime = time;
     frameCount++;
 
     // Logical canvas dimensions (CSS pixels)
     const w = canvas.width / dpr;
     const h = canvas.height / dpr;
+
+    // The pause screen covers the game. Freeze rendering and controls as well as physics.
+    if (pausedAt !== null) return;
 
     // ── Mobile button positions ──
     const btnR = Math.max(Math.min(w, h) * 0.09, 32);
@@ -730,40 +819,36 @@ export function startGame(
     const thrust: 0 | 1 =
       keysDown.has("ArrowUp") || keysDown.has("w") || keysDown.has("W") || foundCT ? 1 : 0;
 
-    // Send input to server when it changes, or at minimum interval
-    if (!display && !superseded && gameStage === 0 && myLander.a === 0) {
-      const changed = thrust !== lastSentThrust || rotation !== lastSentRotation;
-      if (changed || time - lastInputTime >= INPUT_INTERVAL) {
-        lastInputTime = time;
-        sendInput(thrust, rotation);
-      }
-    }
-
-    // ── Client-side extrapolation (smooth 60fps from 20Hz server ticks) ──
-    if (gameStage === 0) {
-      const sinceTick = (performance.now() - lastServerTime) / 1000;
-      if (sinceTick > 0 && sinceTick < MAX_EXTRAPOLATION) {
-        // Extrapolate my lander from last server snapshot
-        if (!display && serverMyLander.a === 0) {
-          myLander.x = serverMyLander.x + serverMyLander.vx * sinceTick;
-          myLander.y = serverMyLander.y + serverMyLander.vy * sinceTick;
-          myLander.r = serverMyLander.r + serverMyLander.vr * sinceTick;
-          // Wrap x
-          if (myLander.x > MAP_WIDTH) myLander.x -= MAP_WIDTH;
-          if (myLander.x < 0) myLander.x += MAP_WIDTH;
-        }
-        // Extrapolate remote landers
-        for (const [id, lander] of remoteLanders) {
-          const srv = serverRemoteLanders.get(id);
-          if (srv && srv.a === 0) {
-            lander.x = srv.x + srv.vx * sinceTick;
-            lander.y = srv.y + srv.vy * sinceTick;
-            lander.r = srv.r + srv.vr * sinceTick;
-            if (lander.x > MAP_WIDTH) lander.x -= MAP_WIDTH;
-            if (lander.x < 0) lander.x += MAP_WIDTH;
+    // Local simulation is independent of the arrival rate of server messages.
+    if (!display && connected && !superseded && !document.hidden && gameStage === 0) {
+      if (frameMs > MAX_FRAME_GAP_MS) {
+        // Browser/OS suspension without visibilitychange: reacquire ownership,
+        // never fast-forward a long backlog or upload an obsolete round.
+        suspendFlight();
+        socket.reconnect();
+      } else {
+        const result = localFlight.advance(frameMs, { thrust, rotation, seq: 0 }, mapLines);
+        myLander = localFlight.render();
+        myFuel = myLander.fuel;
+        if (result) {
+          resultPending = true;
+          myScore += result.points;
+          if (myLander.a === 1) {
+            landings.push({ name: idToName.get(myId) ?? "Pilot", color: myColor, expires: time + 5000 });
+            landings = landings.slice(-3);
+          } else {
+            crashes.push({ x: myLander.x, y: myLander.y, time: 0, color: myColor });
+            graves.push({ x: myLander.x, y: myLander.y, color: myColor });
           }
         }
+        if (result || time - lastStateTime >= FLIGHT_TICK_MS) {
+          lastStateTime = time;
+          sendState();
+        }
       }
+    }
+    if (gameStage === 0 && connected) {
+      for (const [id, view] of remoteViews) remoteLanders.set(id, view.sample(time, rawDt * 1000));
     }
 
     // ── Render ──
@@ -1081,6 +1166,7 @@ export function startGame(
 
   // ── Cleanup ──
   return () => {
+    scheduleScreen.destroy();
     displaySettings?.destroy();
     statsScreen?.destroy();
     cancelAnimationFrame(animationId);
@@ -1089,6 +1175,7 @@ export function startGame(
     window.removeEventListener("keydown", onKeyDown);
     window.removeEventListener("keyup", onKeyUp);
     document.removeEventListener("visibilitychange", onVisibilityChange);
+    window.removeEventListener("blur", clearControls);
     canvas.removeEventListener("touchstart", handleTouch);
     canvas.removeEventListener("touchmove", handleTouch);
     canvas.removeEventListener("touchend", handleTouch);

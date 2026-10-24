@@ -3,17 +3,9 @@ import { Server, type Connection } from "partyserver";
 import {
   type RGB,
   type Lander,
-  type MapLine,
-  type PlayerInput,
-  generateTerrain,
   createDefaultLander,
-  updateLanderPhysics,
-  applyInput,
-  checkCollision,
-  determineLandingOutcome,
-  isOutOfBounds,
-  calculateLandingScore,
 } from "../lib/simulation";
+import { isFlightUpdate, reportedLander, type FlightUpdate } from "../lib/flight-protocol";
 import {
   type BinaryPlayerEntry,
   type PlayerSnapshot,
@@ -27,24 +19,21 @@ import { updateCamera, type CameraState, type CameraCommand } from "../lib/camer
 import { SessionTracker, type SessionStats } from "../lib/session-stats";
 import { normalizeName } from "../lib/names";
 import { SHIP_COLORS } from "../lib/colors";
+import { getPlaySchedule, type PlaySchedule } from "../lib/play-schedule";
 
 const COLORS = SHIP_COLORS.map((ship) => ship.color);
 
 const TERRAIN_REVEAL_MS = 1800;
 
 const TICK_MS = 50; // 20 Hz
+const SILENT_CLIENT_MS = 15000;
 const MAX_PLAYERS = 255; // uint8 slot limit in binary protocol
 
 function randomSeed(): number {
   return Math.floor(Math.random() * 2147483647);
 }
 
-type ClientMessage = { type: "options"; sessionId: string; name?: string; options?: Partial<DisplayOptions> } | { type: "camera"; command: CameraCommand } | { type: "start_session"; name: string } | { type: "quit_session"; sessionId: string } | {
-  type: "input";
-  thrust: 0 | 1;
-  rotation: -1 | 0 | 1;
-  seq: number;
-};
+type ClientMessage = FlightUpdate | { type: "suspend"; authority: string } | { type: "options"; sessionId: string; name?: string; options?: Partial<DisplayOptions> } | { type: "camera"; command: CameraCommand } | { type: "start_session"; name: string } | { type: "quit_session"; sessionId: string };
 
 interface PlayerState {
   connection: Connection;
@@ -52,7 +41,11 @@ interface PlayerState {
   joinedAt: number;
   name: string;
   lander: Lander;
-  lastInput: PlayerInput;
+  authority: string;
+  lastSeq: number;
+  lastSeenAt: number;
+  elapsedMs: number;
+  statsFlightBase: number;
   color: RGB;
   score: number;
   slot: number;
@@ -69,11 +62,15 @@ export class GameServer extends Server<Env> {
   }
   lastStatsSent = 0;
   roundStartedAt = 0;
+  playSchedule: PlaySchedule | null = null;
+  scheduleKey = "";
+  pausedAt: number | null = null;
 
   async onStart(): Promise<void> {
     const saved = await this.ctx.storage.get<SessionStats>("session-stats");
     if (saved?.id && saved.name && saved.expiresAt > Date.now()) {
       this.stats = new SessionTracker(saved);
+      this.syncPlaySchedule();
       this.scheduleNextAlarm();
     } else {
       await this.ctx.storage.put("session-stats", null);
@@ -89,6 +86,8 @@ export class GameServer extends Server<Env> {
   quitSession(): void {
     this.stats = null;
     this.publishStats();
+    this.syncPlaySchedule();
+    this.scheduleNextAlarm();
   }
 
   publishStats(): void {
@@ -101,19 +100,68 @@ export class GameServer extends Server<Env> {
   startSession(name: string): void {
     if (this.stats) return;
     this.stats = SessionTracker.create(crypto.randomUUID(), name);
+    for (const player of [...this.players.values(), ...this.departed.values()]) player.statsFlightBase = player.elapsedMs;
     for (const player of this.players.values()) this.stats.join(player.pilotId, player.name);
     this.publishStats();
+    this.syncPlaySchedule();
+    this.scheduleNextAlarm();
+  }
+
+  syncPlaySchedule(now = Date.now()): void {
+    const session = this.stats?.state ?? null;
+    const key = session ? `${session.id}:${session.name}` : "";
+    if (key === this.scheduleKey && (!this.playSchedule || now < this.playSchedule.changesAt)) return;
+    this.scheduleKey = key;
+    const next = getPlaySchedule(session, now);
+    const wasPaused = this.pausedAt !== null;
+    this.playSchedule = next;
+
+    if (next?.phase === "paused" && !wasPaused) {
+      this.epoch++;
+      this.pausedAt = now;
+      for (const player of this.players.values()) {
+        player.lander.t = 0;
+        player.lander.vr = 0;
+      }
+      this.prevSent.clear();
+    } else if (next?.phase !== "paused" && this.pausedAt !== null) {
+      this.epoch++;
+      const duration = now - this.pausedAt;
+      for (const player of this.players.values()) {
+        player.joinedAt += now - Math.max(this.pausedAt, player.joinedAt);
+        player.lastSeenAt = now;
+      }
+      // Landing records and all round deadlines exclude time spent paused.
+      if (this.roundStartedAt > 0) {
+        const startedAt = session?.startedAt ?? 0;
+        this.roundStartedAt = Math.max(this.roundStartedAt, startedAt) + now - Math.max(this.pausedAt, startedAt);
+      }
+      if (this.revealDeadline > 0) this.revealDeadline += duration;
+      if (this.endgameDeadline > 0) this.endgameDeadline += duration;
+      if (this.intermissionDeadline > 0) this.intermissionDeadline += duration;
+      this.pausedAt = null;
+    }
+
+    this.broadcast(JSON.stringify({ type: "play_schedule", schedule: next, epoch: this.epoch }));
+    if (wasPaused && this.pausedAt === null) {
+      if (this.stage === 1 && !this.intermissionDeadline && this.players.size > 0) this.beginNewRound();
+      else this.checkEndgame();
+    }
     this.scheduleNextAlarm();
   }
 
   seed = randomSeed();
+  roundId = randomSeed();
+  epoch = 0;
   stage = 1; // 0=playing, 1=waiting, 2=drawing terrain
   colorIndex = 0;
   nextSlot = 0;
   freeSlots: number[] = [];
   players = new Map<string, PlayerState>();
+  // Retain accepted flights through disconnects until this round ends. Detached
+  // ships never block the round; terminal states also prevent duplicate results.
+  departed = new Map<string, PlayerState>();
   prevSent = new Map<string, PlayerSnapshot>();
-  mapLines: MapLine[] = [];
   tickRunning = false;
 
   // Timers tracked as absolute timestamps (checked each tick)
@@ -130,10 +178,12 @@ export class GameServer extends Server<Env> {
   // ── Alarm-based tick loop ────────────────────────────────────
 
   scheduleNextAlarm(): void {
-    const next = this.tickRunning || this.intermissionDeadline > 0
-      ? Date.now() + TICK_MS
-      : this.stats?.state.expiresAt;
-    if (next !== undefined) this.ctx.storage.setAlarm(next);
+    const next = Math.min(
+      this.pausedAt === null && (this.tickRunning || this.intermissionDeadline > 0) ? Date.now() + TICK_MS : Infinity,
+      this.playSchedule?.changesAt ?? Infinity,
+      this.stats?.state.expiresAt ?? Infinity,
+    );
+    if (Number.isFinite(next)) this.ctx.storage.setAlarm(next);
   }
 
   startTickLoop(): void {
@@ -148,6 +198,11 @@ export class GameServer extends Server<Env> {
 
   async onAlarm(): Promise<void> {
     this.expireSession();
+    this.syncPlaySchedule();
+    if (this.pausedAt !== null) {
+      this.scheduleNextAlarm();
+      return;
+    }
     // Handle intermission → new round transition (can happen while tick is stopped)
     if (this.intermissionDeadline > 0 && Date.now() >= this.intermissionDeadline) {
       this.intermissionDeadline = 0;
@@ -168,7 +223,8 @@ export class GameServer extends Server<Env> {
         this.stage = 0;
         this.roundStartedAt = Date.now();
         this.revealDeadline = 0;
-        this.broadcast(JSON.stringify({ type: "stage", stage: 0 }));
+        for (const player of this.players.values()) player.lastSeenAt = Date.now();
+        this.broadcast(JSON.stringify({ type: "stage", stage: 0, roundId: this.roundId }));
       } else {
         this.scheduleNextAlarm();
         return;
@@ -188,37 +244,14 @@ export class GameServer extends Server<Env> {
   }
 
   tick(): void {
-    if (this.stage !== 0 || this.players.size === 0) return;
+    if (this.pausedAt !== null || this.stage !== 0 || this.players.size === 0) return;
 
-    const dt = TICK_MS / 1000;
-
-    for (const [, ps] of this.players) {
-      if (ps.lander.a !== 0) continue;
-
-      applyInput(ps.lander, ps.lastInput);
-      updateLanderPhysics(ps.lander, dt);
-
-      if (checkCollision(ps.lander, this.mapLines)) {
-        const outcome = determineLandingOutcome(ps.lander);
-        ps.lander.a = outcome;
-        this.stats?.outcome(ps.pilotId, outcome === 1, Date.now() - Math.max(this.roundStartedAt, ps.joinedAt, this.stats?.state.startedAt ?? 0));
-        this.publishStats();
-        const points = calculateLandingScore(ps.lander);
-        ps.score += points;
-        if (outcome === 1 && points === 50) {
-          // Good landing bonus: +50 fuel
-          ps.lander.fuel += 50;
-        }
-        if (outcome === 2) {
-          this.broadcast(encodeCrash(ps.lander.x, ps.lander.y, ps.color));
-        }
-      } else if (isOutOfBounds(ps.lander)) {
-        ps.lander.a = 2;
-        this.stats?.outcome(ps.pilotId, false, 0);
-        this.publishStats();
-        ps.score += 5; // crash score
-        this.broadcast(encodeCrash(ps.lander.x, ps.lander.y, ps.color));
-      }
+    // A suspended browser cannot simulate. Remove its active ship without
+    // inventing a crash, even if the underlying socket never delivers a close.
+    for (const ps of this.players.values()) {
+      if (ps.lander.a !== 0 || Date.now() - ps.lastSeenAt < SILENT_CLIENT_MS) continue;
+      this.onClose(ps.connection);
+      try { ps.connection.close(4002, "Flight suspended; reconnect to resume"); } catch { /* Already closed. */ }
     }
 
     // Broadcast world snapshot (binary, delta-compressed)
@@ -256,7 +289,7 @@ export class GameServer extends Server<Env> {
     }
 
     if (entries.length > 0) {
-      this.broadcast(encodeWorldUpdate(entries));
+      this.broadcast(encodeWorldUpdate(this.roundId, entries));
     }
     this.checkEndgame();
   }
@@ -265,6 +298,7 @@ export class GameServer extends Server<Env> {
 
   onConnect(connection: Connection, context: { request: Request }): void {
     this.expireSession();
+    this.syncPlaySchedule();
     const query = new URL(context.request.url).searchParams;
     const controller = query.get("mode") === "camera";
     const spectator = query.get("mode") === "display" || controller;
@@ -275,12 +309,15 @@ export class GameServer extends Server<Env> {
     const pilotId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestedId) ? requestedId : connection.id;
     // A browser UUID owns one active ship. Transfer it before closing its old socket,
     // so delayed close/error callbacks cannot delete the replacement connection.
-    let previous: PlayerState | undefined;
+    let transferredSlot: number | undefined;
+    let previous: PlayerState | undefined = spectator ? undefined : this.departed.get(pilotId);
+    if (!spectator) this.departed.delete(pilotId);
     if (!spectator) {
       for (const [id, player] of this.players) {
         if (player.pilotId !== pilotId && id !== connection.id) continue;
-        if (previous && previous.slot !== player.slot) this.freeSlots.push(previous.slot);
+        if (previous && this.players.has(previous.connection.id) && previous.slot !== player.slot) this.freeSlots.push(previous.slot);
         previous = player;
+        transferredSlot = player.slot;
         this.players.delete(id);
         this.prevSent.delete(id);
         this.stats?.leave(player.pilotId);
@@ -295,7 +332,7 @@ export class GameServer extends Server<Env> {
     }
     const color: RGB = previous?.color ?? (spectator ? [255, 255, 255] : COLORS[this.colorIndex % COLORS.length]);
     if (!spectator && !previous) this.colorIndex++;
-    const slot = spectator ? -1 : previous?.slot ?? this.allocSlot();
+    const slot = spectator ? -1 : transferredSlot ?? this.allocSlot();
 
     if (!spectator && slot === -1) {
       connection.close(4000, "Server full");
@@ -303,19 +340,23 @@ export class GameServer extends Server<Env> {
     }
 
     // Transition from waiting → playing before building init payload
-    const wasWaiting = !spectator && this.stage === 1;
+    const wasWaiting = !spectator && this.stage === 1 && !this.intermissionDeadline && this.pausedAt === null;
     if (wasWaiting) {
       this.seed = randomSeed();
       this.stage = 2;
       this.revealDeadline = Date.now() + TERRAIN_REVEAL_MS;
-      this.mapLines = generateTerrain(this.seed);
+      this.roundId = (this.roundId + 1) >>> 0;
+      this.departed.clear();
       this.endgameDeadline = 0;
       this.intermissionDeadline = 0;
       this.prevSent.clear();
       // Reset existing players for the new round (preserve connections)
       for (const [, ps] of this.players) {
         ps.lander = createDefaultLander(ps.color);
-        ps.lastInput = { thrust: 0, rotation: 0, seq: 0 };
+        ps.elapsedMs = 0;
+        ps.statsFlightBase = 0;
+        ps.lastSeq = -1;
+        ps.lastSeenAt = Date.now();
       }
     }
 
@@ -326,8 +367,12 @@ export class GameServer extends Server<Env> {
         name,
         pilotId,
         joinedAt: previous?.joinedAt ?? Date.now(),
-        lander: previous?.lander ?? createDefaultLander(color),
-        lastInput: { thrust: 0, rotation: 0, seq: 0 },
+        lander: !wasWaiting && previous ? previous.lander : createDefaultLander(color),
+        authority: crypto.randomUUID(),
+        lastSeq: -1,
+        lastSeenAt: Date.now(),
+        elapsedMs: !wasWaiting ? previous?.elapsedMs ?? 0 : 0,
+        statsFlightBase: !wasWaiting ? previous?.statsFlightBase ?? 0 : 0,
         color,
         score: previous?.score ?? 0,
         slot,
@@ -387,32 +432,40 @@ export class GameServer extends Server<Env> {
         color,
         slot,
         seed: this.seed,
+        roundId: this.roundId,
+        epoch: this.epoch,
+        authority: spectator ? null : this.players.get(connection.id)!.authority,
+        endgameMs: Math.max(0, this.endgameDeadline - (this.pausedAt ?? Date.now())),
         stage: this.stage,
-        revealMs: Math.max(0, this.revealDeadline - Date.now()),
+        revealMs: Math.max(0, this.revealDeadline - (this.pausedAt ?? Date.now())),
         players: playersInit,
         camera: this.camera,
-        self: spectator ? null : { lander: this.players.get(connection.id)!.lander, score: this.players.get(connection.id)!.score },
+        self: spectator ? null : { lander: this.players.get(connection.id)!.lander, score: this.players.get(connection.id)!.score, elapsedMs: this.players.get(connection.id)!.elapsedMs },
         stats: this.stats?.snapshot() ?? null,
+        playSchedule: this.playSchedule ? { ...this.playSchedule, serverNow: Date.now() } : null,
       }),
     );
 
     if (!spectator)
       this.broadcast(
-        JSON.stringify({ type: "player_join", id: connection.id, pilotId, name, color, slot }),
+        JSON.stringify({ type: "player_join", id: connection.id, pilotId, name, color, slot, lander: this.players.get(connection.id)!.lander }),
         [connection.id],
       );
 
     if (wasWaiting) {
       // Notify existing players about the new round (new player already has correct data)
-      this.broadcast(JSON.stringify({ type: "new_round", seed: this.seed, revealMs: TERRAIN_REVEAL_MS }), [connection.id]);
+      this.broadcast(JSON.stringify({ type: "new_round", roundId: this.roundId, seed: this.seed, revealMs: TERRAIN_REVEAL_MS }), [connection.id]);
     }
 
     this.publishCamera();
-    if (!spectator) this.startTickLoop();
+    if (!spectator) {
+      this.startTickLoop();
+      this.checkEndgame();
+    }
   }
 
   onMessage(connection: Connection, message: string | ArrayBuffer): void {
-    if (typeof message !== "string") return;
+    if (typeof message !== "string" || message.length > 4096) return;
 
     let data: ClientMessage;
     try {
@@ -421,7 +474,9 @@ export class GameServer extends Server<Env> {
       return;
     }
 
+    if (!data || typeof data !== "object" || Array.isArray(data)) return;
     this.expireSession();
+    this.syncPlaySchedule();
     if (data.type === "options") {
       if (!this.displays.has(connection.id) || !this.stats || this.stats.state.id !== data.sessionId) return;
       if (data.name !== undefined) {
@@ -430,6 +485,7 @@ export class GameServer extends Server<Env> {
       }
       if (data.options && typeof data.options === "object") this.stats.state.options = validateDisplayOptions(this.stats.state.options, data.options);
       this.publishStats();
+      this.syncPlaySchedule();
       return;
     }
     if (data.type === "camera") {
@@ -452,16 +508,36 @@ export class GameServer extends Server<Env> {
       connection.send(JSON.stringify({ type: "stats", stats: this.stats?.snapshot() ?? null }));
       return;
     }
-    if (data.type !== "input" || this.stage !== 0) return;
-
     const ps = this.players.get(connection.id);
-    if (!ps || ps.connection !== connection) return;
+    if (!ps || ps.connection !== connection || data.authority !== ps.authority) return;
+    if (data.type === "suspend") {
+      this.onClose(connection);
+      connection.close(4002, "Flight suspended");
+      return;
+    }
+    if (!isFlightUpdate(data) || data.roundId !== this.roundId || data.epoch !== this.epoch ||
+      this.pausedAt !== null || this.stage !== 0 || data.seq <= ps.lastSeq || data.elapsedMs < ps.elapsedMs) return;
 
-    ps.lastInput = {
-      thrust: data.thrust === 1 ? 1 : 0,
-      rotation: data.rotation === -1 ? -1 : data.rotation === 1 ? 1 : 0,
-      seq: typeof data.seq === "number" ? data.seq : 0,
-    };
+    ps.lastSeq = data.seq;
+    ps.lastSeenAt = Date.now();
+    if (ps.lander.a === 0) {
+      Object.assign(ps.lander, reportedLander({ ...data.lander, color: ps.color }));
+      ps.elapsedMs = data.elapsedMs;
+      if (data.result) {
+        ps.lander.t = 0;
+        ps.lander.vr = 0;
+        ps.score += data.result.points;
+        this.stats?.outcome(ps.pilotId, data.lander.a === 1, Math.max(0, ps.elapsedMs - ps.statsFlightBase));
+        this.publishStats();
+        if (data.lander.a === 2) this.broadcast(encodeCrash(this.roundId, ps.slot, ps.lander.x, ps.lander.y, ps.color));
+        this.checkEndgame();
+      }
+    }
+    // Results are terminal for this pilot/round, including across reconnects.
+    // Repeated reports get an ack but never award points or stats again.
+    if (ps.lander.a !== 0) connection.send(JSON.stringify({
+      type: "result_ack", roundId: this.roundId, authority: ps.authority, score: ps.score,
+    }));
   }
 
   onClose(connection: Connection): void {
@@ -474,6 +550,7 @@ export class GameServer extends Server<Env> {
     this.publishStats();
     this.freeSlots.push(ps.slot);
     this.players.delete(connection.id);
+    this.departed.set(ps.pilotId, ps);
     if (this.camera.followPilotId === ps.pilotId) this.camera = { ...this.camera, followPilotId: null };
     this.publishCamera();
     this.prevSent.delete(connection.id);
@@ -482,7 +559,7 @@ export class GameServer extends Server<Env> {
     if (this.players.size === 0) {
       this.stage = 1;
       this.revealDeadline = 0;
-      this.broadcast(JSON.stringify({ type: "stage", stage: 1 }));
+      this.broadcast(JSON.stringify({ type: "stage", stage: 1, roundId: this.roundId }));
       this.stopTickLoop();
       this.endgameDeadline = 0;
       this.intermissionDeadline = 0;
@@ -500,23 +577,23 @@ export class GameServer extends Server<Env> {
   // ── Endgame / Round Logic ────────────────────────────────────
 
   checkEndgame(): void {
-    if (this.stage !== 0 || this.players.size === 0) return;
+    if (this.pausedAt !== null || this.stage !== 0 || this.players.size === 0) return;
 
     const allDone = [...this.players.values()].every((ps) => ps.lander.a !== 0);
 
     if (allDone && this.endgameDeadline === 0) {
       this.endgameDeadline = Date.now() + 6000;
-      this.broadcast(JSON.stringify({ type: "endgame_start" }));
+      this.broadcast(JSON.stringify({ type: "endgame_start", roundId: this.roundId }));
     } else if (!allDone && this.endgameDeadline > 0) {
       this.endgameDeadline = 0;
-      this.broadcast(JSON.stringify({ type: "endgame_cancel" }));
+      this.broadcast(JSON.stringify({ type: "endgame_cancel", roundId: this.roundId }));
     }
   }
 
   enterIntermission(): void {
     this.stage = 1;
     this.stopTickLoop();
-    this.broadcast(JSON.stringify({ type: "stage", stage: 1 }));
+    this.broadcast(JSON.stringify({ type: "stage", stage: 1, roundId: this.roundId }));
 
     // Schedule new round after 4s intermission
     this.intermissionDeadline = Date.now() + 4000;
@@ -527,19 +604,25 @@ export class GameServer extends Server<Env> {
     this.seed = randomSeed();
     this.stage = 2;
     this.revealDeadline = Date.now() + TERRAIN_REVEAL_MS;
-    this.mapLines = generateTerrain(this.seed);
+    this.roundId = (this.roundId + 1) >>> 0;
+    this.departed.clear();
+    this.intermissionDeadline = 0;
     this.endgameDeadline = 0;
     this.prevSent.clear();
 
     // Reset all connected players (preserve score across rounds)
     for (const [, ps] of this.players) {
       ps.lander = createDefaultLander(ps.color);
-      ps.lastInput = { thrust: 0, rotation: 0, seq: 0 };
+      ps.elapsedMs = 0;
+      ps.statsFlightBase = 0;
+      ps.lastSeq = -1;
+      ps.lastSeenAt = Date.now();
     }
 
     this.broadcast(
       JSON.stringify({
         type: "new_round",
+        roundId: this.roundId,
         seed: this.seed,
         revealMs: TERRAIN_REVEAL_MS,
       }),

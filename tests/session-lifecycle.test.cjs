@@ -80,7 +80,7 @@ function load(file) {
   assert.equal(server.stats.state.joined, 2, 'Same name with different UUID counts separately');
   server.onClose(returning);
   server.onClose(different);
-  assert.equal(server.alarm, expiry, 'Expiry alarm remains scheduled with no players');
+  assert.equal(server.alarm, Math.min(expiry, server.playSchedule.changesAt), 'The next schedule boundary or expiry remains scheduled with no players');
   const restored = new GameServer();
   restored.saved = server.saved;
   await restored.onStart();
@@ -110,8 +110,9 @@ function load(file) {
   assert.equal(server.saved.get('session-stats'), null);
   assert.equal(server.players.get('next-player').lander, ship, 'Quitting does not reset the ship');
   server.stage = 0;
-  server.onMessage(nextPlayer, JSON.stringify({ type: 'input', thrust: 1, rotation: -1, seq: 3 }));
-  assert.equal(server.players.get('next-player').lastInput.thrust, 1, 'Standalone play accepts input');
+  const activeShip = server.players.get('next-player');
+  server.onMessage(nextPlayer, JSON.stringify({ type: 'state', authority: activeShip.authority, roundId: server.roundId, epoch: server.epoch, seq: 3, lander: { ...ship, t: 1, vr: -1 }, elapsedMs: 50, result: null }));
+  assert.equal(activeShip.lander.t, 1, 'Standalone play accepts client state');
   server.onMessage(display, JSON.stringify({ type: 'start_session', name: 'New Session' }));
   assert.equal(server.stats.state.joined, 1, 'Existing ship joins the new session automatically');
   assert.equal(server.stats.state.pilots[0].id, pilotId);
