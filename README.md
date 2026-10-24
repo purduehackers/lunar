@@ -4,6 +4,12 @@ Multiplayer lunar lander game. Land your spacecraft on procedurally generated te
 
 Built with Astro, PartyServer (Cloudflare Durable Objects), and canvas.
 
+Each browser owns its lander's physics, fuel, collisions, landing/crash result, and landing score. Physics runs at a fixed 20 Hz regardless of display refresh rate; drawing remains smooth between ticks. The server accepts and relays state at 20 Hz, aggregates scores and session stats, and controls terrain seeds, rounds, play windows, and shared cameras. Remote ships smooth received positions with at most 150 ms of extrapolation. Server echoes never replace the owning browser's current simulation.
+
+Flight reports include a connection authority token, round ID, pause generation, and increasing sequence number. The server validates message structure and finite values, but trusts the reported flight and outcome; it does not repeat physics or attempt anti-cheat. Each pilot's outcome counts once per round. Landing records use the browser's active flight clock, excluding pauses and time offline.
+
+Hidden tabs stop their flight connection. A browser suspension longer than one second also requires a fresh connection before flight resumes; there is no large physics catch-up. The server removes silent flying clients after 15 seconds without recording a crash. A reconnect resumes the last accepted state if that round is still active; when the fleet empties or a round changes, the next flight starts fresh. Opening the same pilot in another tab transfers ownership and stops the superseded tab from reconnecting. Live flights are in memory; after a server restart, reconnecting clients start a new flight while saved session stats remain.
+
 Open `/display` for a spectator display of the whole fleet. Display browsers do not create ships or participate in rounds. The camera follows ships approaching the terrain and briefly holds on successful landings. Nearby approaches share a view; distant approaches split into up to four views. More than four simultaneous approaches use the full fleet view. Players enter a name before their first launch; the browser remembers it for future visits. Names appear beside rockets and in landing announcements.
 
 ## Controls
@@ -38,7 +44,7 @@ Run `node tests/session-stats.test.cjs` and `node tests/session-lifecycle.test.c
 
 A session named **Hack Night** (case-insensitive) automatically follows Purdue's local time (`America/Indiana/Indianapolis`). Play is unrestricted before 9:00 p.m. Starting at 9:00 p.m., the game pauses for the first 45 minutes of every hour and opens for the final 15 minutes: paused 9:00–9:45, playable 9:45–10:00, paused 10:00–10:45, and so on through midnight until the session ends. Sessions opened between midnight and 9:00 a.m. use the previous night's schedule.
 
-Players and displays show a pause screen with a countdown, plus the time remaining during play windows. The server freezes ships and round timers and rejects flight input during pauses, including for newly connected players. Flights resume automatically; paused time is excluded from landing records. Connected-time totals still measure time connected. The schedule survives restarts through the saved session. Other session names and play without a session remain unrestricted; renaming or ending a Hack Night session updates the schedule immediately.
+Players and displays show a pause screen with a countdown, plus the time remaining during play windows. Browsers freeze their flights while the server freezes round timers and rejects flight reports during pauses, including for newly connected players. Flights resume automatically; paused time is excluded from landing records. Connected-time totals still measure time connected. The schedule survives restarts through the saved session. Other session names and play without a session remain unrestricted; renaming or ending a Hack Night session updates the schedule immediately.
 
 Run `node tests/play-schedule.test.cjs` to check schedule boundaries, overnight play, time zones, and server pause/resume behavior.
 
@@ -48,6 +54,8 @@ Run `node tests/play-schedule.test.cjs` to check schedule boundaries, overnight 
 bun install
 bun dev
 ```
+
+Run `bun run test` for physics, client-loop, relay, lifecycle, schedule, camera, and stats checks. With the dev server running, run `bun run test:network http://127.0.0.1:4321` for real WebSocket checks in an isolated local room (two pilots, spectators, reconnects, results, and new rounds). The flight protocol changed with client authority; publish the browser bundle and server together when deploying.
 
 ## Deploy
 

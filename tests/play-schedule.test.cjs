@@ -74,6 +74,10 @@ function connect(server, id, query) {
   return connection;
 }
 function send(server, connection, data) { server.onMessage(connection, JSON.stringify(data)); }
+function report(server, connection, patch = {}, result = null, elapsedMs = 50) {
+  const ps = server.players.get(connection.id);
+  send(server, connection, { type: 'state', authority: ps.authority, roundId: server.roundId, epoch: server.epoch, seq: ps.lastSeq + 1, lander: { ...ps.lander, ...patch }, result, elapsedMs });
+}
 async function setup(time, name = 'Hack Night') {
   now = at(time);
   const server = new GameServer();
@@ -94,21 +98,21 @@ async function advance(server, time) {
   await advance(server, '2026-10-23T20:59:56.800-04:00');
   assert.equal(server.stage, 0);
   const roundStart = server.roundStartedAt;
-  send(server, player, { type: 'input', thrust: 1, rotation: 1, seq: 1 });
+  report(server, player, { t: 1, vr: 1, x: 100 });
   await advance(server, '2026-10-23T20:59:59.950-04:00');
   const ship = server.players.get('player').lander;
-  const before = JSON.stringify({ ...ship, t: 0 });
+  const before = JSON.stringify({ ...ship, t: 0, vr: 0 });
   await advance(server, '2026-10-23T21:00:00-04:00');
   assert.equal(server.playSchedule.phase, 'paused');
   assert.equal(JSON.stringify(ship), before, 'Pausing preserves the flight and clears thrust');
-  assert.equal(server.players.get('player').lastInput.thrust, 0);
-  assert.equal(server.players.get('player').lastInput.rotation, 0);
+  assert.equal(ship.t, 0);
+  assert.equal(ship.vr, 0);
   assert.equal(server.alarm, at('2026-10-23T21:45:00-04:00'), 'Paused servers sleep until the next window');
   await advance(server, '2026-10-23T21:15:00-04:00');
-  send(server, player, { type: 'input', thrust: 1, rotation: -1, seq: 2 });
+  report(server, player, { t: 1, vr: -1, x: 200 });
   server.tick();
   assert.equal(JSON.stringify(ship), before, 'Neither alarms nor input advance paused ships');
-  assert.equal(server.players.get('player').lastInput.thrust, 0, 'Server rejects input from clients during pauses');
+  assert.equal(ship.t, 0, 'Server rejects flight reports during pauses');
   assert.equal(server.stats.state.landed + server.stats.state.crashed, 0);
   const late = connect(server, 'late', `name=Late&pilotId=${randomUUID()}`);
   assert.equal(late.sent.find(m => m.type === 'init').playSchedule.phase, 'paused');
@@ -122,13 +126,11 @@ async function advance(server, time) {
   assert.equal(server.pausedAt, null);
   assert.equal(server.roundStartedAt, roundStart + 45 * 60000);
   assert.equal(server.players.get('late').joinedAt, now, 'Late arrivals start flight timing when play opens');
-  assert.notEqual(JSON.stringify(ship), before, 'Existing flights resume automatically');
-  send(server, replacement, { type: 'input', thrust: 1, rotation: 0, seq: 3 });
-  assert.equal(server.players.get('replacement').lastInput.thrust, 1);
-  send(server, replacement, { type: 'input', thrust: 0, rotation: 0, seq: 4 });
-  Object.assign(ship, { x: 100, y: 0, r: 0, vx: 0, vy: -0.1, vr: 0, a: 0 });
-  server.mapLines = [[0, 0, 3000, 0]];
+  assert.equal(JSON.stringify(ship), before, 'The relay does not simulate flights on resume');
+  report(server, replacement, { x: 101, t: 1 });
+  assert.equal(ship.t, 1, 'Client reports resume after the pause');
   await advance(server, '2026-10-23T21:45:01-04:00');
+  report(server, replacement, { x: 100, y: 0, r: 0, vx: 0, vy: -0.1, vr: 0, a: 1 }, { points: 50 }, 4200);
   assert.equal(server.stats.state.pilots.find(p => p.id === pilotId).fastestMs, 4200, 'Landing records exclude the entire pause');
   await advance(server, '2026-10-23T22:00:00-04:00');
   assert.equal(server.playSchedule.phase, 'paused', 'The next hour pauses again');
@@ -182,8 +184,8 @@ async function advance(server, time) {
   const { server: standalone } = await setup('2026-10-23T21:10:00-04:00', 'Other Session');
   const freePlayer = connect(standalone, 'player', 'name=Free');
   await advance(standalone, '2026-10-23T21:10:02-04:00');
-  send(standalone, freePlayer, { type: 'input', thrust: 1, rotation: 0 });
-  assert.equal(standalone.players.get('player').lastInput.thrust, 1);
+  report(standalone, freePlayer, { t: 1 });
+  assert.equal(standalone.players.get('player').lander.t, 1);
   assert.equal(standalone.playSchedule, null, 'Other sessions remain unrestricted');
   console.log('Hack Night schedule checks passed: time boundaries, midnight, DST, frozen flights and timers, rejected input, reconnects, landing records, idle wakeups, persistence, renaming, quit, and expiry.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

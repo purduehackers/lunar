@@ -8,6 +8,8 @@
     "format": "oxfmt",
     "lint": "oxlint",
     "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.cjs",
+    "test:network": "node tests/live-network.cjs",
     "deploy": "wrangler deploy"
   },
   "dependencies": {

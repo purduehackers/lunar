@@ -1,5 +1,5 @@
 // ─── Shared simulation module (no browser APIs) ─────────────
-// Used by both client (rendering) and server (authoritative physics)
+// Physics runs only in the owning browser; terrain/spawn helpers are shared.
 
 // ─── Types ────────────────────────────────────────────────────
 
