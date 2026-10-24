@@ -27,6 +27,7 @@ import { updateCamera, type CameraState, type CameraCommand } from "../lib/camer
 import { SessionTracker, type SessionStats } from "../lib/session-stats";
 import { normalizeName } from "../lib/names";
 import { SHIP_COLORS } from "../lib/colors";
+import { getPlaySchedule, type PlaySchedule } from "../lib/play-schedule";
 
 const COLORS = SHIP_COLORS.map((ship) => ship.color);
 
@@ -69,11 +70,15 @@ export class GameServer extends Server<Env> {
   }
   lastStatsSent = 0;
   roundStartedAt = 0;
+  playSchedule: PlaySchedule | null = null;
+  scheduleKey = "";
+  pausedAt: number | null = null;
 
   async onStart(): Promise<void> {
     const saved = await this.ctx.storage.get<SessionStats>("session-stats");
     if (saved?.id && saved.name && saved.expiresAt > Date.now()) {
       this.stats = new SessionTracker(saved);
+      this.syncPlaySchedule();
       this.scheduleNextAlarm();
     } else {
       await this.ctx.storage.put("session-stats", null);
@@ -89,6 +94,8 @@ export class GameServer extends Server<Env> {
   quitSession(): void {
     this.stats = null;
     this.publishStats();
+    this.syncPlaySchedule();
+    this.scheduleNextAlarm();
   }
 
   publishStats(): void {
@@ -103,6 +110,47 @@ export class GameServer extends Server<Env> {
     this.stats = SessionTracker.create(crypto.randomUUID(), name);
     for (const player of this.players.values()) this.stats.join(player.pilotId, player.name);
     this.publishStats();
+    this.syncPlaySchedule();
+    this.scheduleNextAlarm();
+  }
+
+  syncPlaySchedule(now = Date.now()): void {
+    const session = this.stats?.state ?? null;
+    const key = session ? `${session.id}:${session.name}` : "";
+    if (key === this.scheduleKey && (!this.playSchedule || now < this.playSchedule.changesAt)) return;
+    this.scheduleKey = key;
+    const next = getPlaySchedule(session, now);
+    const wasPaused = this.pausedAt !== null;
+    this.playSchedule = next;
+
+    if (next?.phase === "paused" && !wasPaused) {
+      this.pausedAt = now;
+      for (const player of this.players.values()) {
+        player.lastInput = { thrust: 0, rotation: 0, seq: 0 };
+        player.lander.t = 0;
+      }
+      this.prevSent.clear();
+    } else if (next?.phase !== "paused" && this.pausedAt !== null) {
+      const duration = now - this.pausedAt;
+      for (const player of this.players.values()) {
+        player.joinedAt += now - Math.max(this.pausedAt, player.joinedAt);
+      }
+      // Landing records and all round deadlines exclude time spent paused.
+      if (this.roundStartedAt > 0) {
+        const startedAt = session?.startedAt ?? 0;
+        this.roundStartedAt = Math.max(this.roundStartedAt, startedAt) + now - Math.max(this.pausedAt, startedAt);
+      }
+      if (this.revealDeadline > 0) this.revealDeadline += duration;
+      if (this.endgameDeadline > 0) this.endgameDeadline += duration;
+      if (this.intermissionDeadline > 0) this.intermissionDeadline += duration;
+      this.pausedAt = null;
+    }
+
+    this.broadcast(JSON.stringify({ type: "play_schedule", schedule: next }));
+    if (wasPaused && this.pausedAt === null) {
+      if (this.stage === 1 && !this.intermissionDeadline && this.players.size > 0) this.beginNewRound();
+      else this.checkEndgame();
+    }
     this.scheduleNextAlarm();
   }
 
@@ -130,10 +178,12 @@ export class GameServer extends Server<Env> {
   // ── Alarm-based tick loop ────────────────────────────────────
 
   scheduleNextAlarm(): void {
-    const next = this.tickRunning || this.intermissionDeadline > 0
-      ? Date.now() + TICK_MS
-      : this.stats?.state.expiresAt;
-    if (next !== undefined) this.ctx.storage.setAlarm(next);
+    const next = Math.min(
+      this.pausedAt === null && (this.tickRunning || this.intermissionDeadline > 0) ? Date.now() + TICK_MS : Infinity,
+      this.playSchedule?.changesAt ?? Infinity,
+      this.stats?.state.expiresAt ?? Infinity,
+    );
+    if (Number.isFinite(next)) this.ctx.storage.setAlarm(next);
   }
 
   startTickLoop(): void {
@@ -148,6 +198,11 @@ export class GameServer extends Server<Env> {
 
   async onAlarm(): Promise<void> {
     this.expireSession();
+    this.syncPlaySchedule();
+    if (this.pausedAt !== null) {
+      this.scheduleNextAlarm();
+      return;
+    }
     // Handle intermission → new round transition (can happen while tick is stopped)
     if (this.intermissionDeadline > 0 && Date.now() >= this.intermissionDeadline) {
       this.intermissionDeadline = 0;
@@ -188,7 +243,7 @@ export class GameServer extends Server<Env> {
   }
 
   tick(): void {
-    if (this.stage !== 0 || this.players.size === 0) return;
+    if (this.pausedAt !== null || this.stage !== 0 || this.players.size === 0) return;
 
     const dt = TICK_MS / 1000;
 
@@ -265,6 +320,7 @@ export class GameServer extends Server<Env> {
 
   onConnect(connection: Connection, context: { request: Request }): void {
     this.expireSession();
+    this.syncPlaySchedule();
     const query = new URL(context.request.url).searchParams;
     const controller = query.get("mode") === "camera";
     const spectator = query.get("mode") === "display" || controller;
@@ -303,7 +359,7 @@ export class GameServer extends Server<Env> {
     }
 
     // Transition from waiting → playing before building init payload
-    const wasWaiting = !spectator && this.stage === 1;
+    const wasWaiting = !spectator && this.stage === 1 && this.pausedAt === null;
     if (wasWaiting) {
       this.seed = randomSeed();
       this.stage = 2;
@@ -388,11 +444,12 @@ export class GameServer extends Server<Env> {
         slot,
         seed: this.seed,
         stage: this.stage,
-        revealMs: Math.max(0, this.revealDeadline - Date.now()),
+        revealMs: Math.max(0, this.revealDeadline - (this.pausedAt ?? Date.now())),
         players: playersInit,
         camera: this.camera,
         self: spectator ? null : { lander: this.players.get(connection.id)!.lander, score: this.players.get(connection.id)!.score },
         stats: this.stats?.snapshot() ?? null,
+        playSchedule: this.playSchedule ? { ...this.playSchedule, serverNow: Date.now() } : null,
       }),
     );
 
@@ -422,6 +479,7 @@ export class GameServer extends Server<Env> {
     }
 
     this.expireSession();
+    this.syncPlaySchedule();
     if (data.type === "options") {
       if (!this.displays.has(connection.id) || !this.stats || this.stats.state.id !== data.sessionId) return;
       if (data.name !== undefined) {
@@ -430,6 +488,7 @@ export class GameServer extends Server<Env> {
       }
       if (data.options && typeof data.options === "object") this.stats.state.options = validateDisplayOptions(this.stats.state.options, data.options);
       this.publishStats();
+      this.syncPlaySchedule();
       return;
     }
     if (data.type === "camera") {
@@ -452,7 +511,7 @@ export class GameServer extends Server<Env> {
       connection.send(JSON.stringify({ type: "stats", stats: this.stats?.snapshot() ?? null }));
       return;
     }
-    if (data.type !== "input" || this.stage !== 0) return;
+    if (data.type !== "input" || this.pausedAt !== null || this.stage !== 0) return;
 
     const ps = this.players.get(connection.id);
     if (!ps || ps.connection !== connection) return;
@@ -500,7 +559,7 @@ export class GameServer extends Server<Env> {
   // ── Endgame / Round Logic ────────────────────────────────────
 
   checkEndgame(): void {
-    if (this.stage !== 0 || this.players.size === 0) return;
+    if (this.pausedAt !== null || this.stage !== 0 || this.players.size === 0) return;
 
     const allDone = [...this.players.values()].every((ps) => ps.lander.a !== 0);
 

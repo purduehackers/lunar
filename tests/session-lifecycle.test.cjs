@@ -80,7 +80,7 @@ function load(file) {
   assert.equal(server.stats.state.joined, 2, 'Same name with different UUID counts separately');
   server.onClose(returning);
   server.onClose(different);
-  assert.equal(server.alarm, expiry, 'Expiry alarm remains scheduled with no players');
+  assert.equal(server.alarm, Math.min(expiry, server.playSchedule.changesAt), 'The next schedule boundary or expiry remains scheduled with no players');
   const restored = new GameServer();
   restored.saved = server.saved;
   await restored.onStart();

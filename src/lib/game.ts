@@ -2,6 +2,8 @@ import { createDisplaySettings } from "./display-settings-screen";
 import type { CameraState } from "./camera";
 import { createStatsScreen } from "./stats-screen";
 import type { SessionStats } from "./session-stats";
+import type { PlaySchedule } from "./play-schedule";
+import { createPlayScheduleScreen } from "./play-schedule-screen";
 import PartySocket from "partysocket";
 import { normalizeName } from "./names";
 import { approachBounds, cameraGroups, displayViewports, wrappedDistance } from "./display";
@@ -53,6 +55,7 @@ type ServerMessage =
       camera: CameraState;
       self: { lander: Lander; score: number } | null;
       stats: SessionStats | null;
+      playSchedule: PlaySchedule | null;
       id: string;
       name?: string;
       color: RGB;
@@ -82,6 +85,7 @@ type ServerMessage =
     }
   | { type: "superseded" }
   | { type: "stats"; stats: SessionStats | null }
+  | { type: "play_schedule"; schedule: PlaySchedule | null }
   | { type: "camera"; camera: CameraState }
   | { type: "player_join"; id: string; pilotId: string; color: RGB; slot: number; name?: string }
   | { type: "player_leave"; id: string }
@@ -309,6 +313,7 @@ export function startGame(
 ): () => void {
   const display = options.display === true;
   const statsScreen = display ? createStatsScreen(name => socket.send(JSON.stringify({ type: "start_session", name }))) : null;
+  const scheduleScreen = createPlayScheduleScreen(display);
   const displaySettings = display ? createDisplaySettings(
     (sessionId, patch) => socket.send(JSON.stringify({ type: "options", sessionId, ...patch })),
     sessionId => socket.send(JSON.stringify({ type: "quit_session", sessionId })),
@@ -350,6 +355,7 @@ export function startGame(
   let roundStartTime = 0;
   let revealStartTime = 0;
   let revealDuration = 0;
+  let pausedAt: number | null = null;
   const isMobile = window.matchMedia("(pointer: coarse)").matches;
 
   // Track last sent input to only send on change
@@ -391,6 +397,7 @@ export function startGame(
       if (e.key === "Escape") { statsScreen?.hide(); displaySettings?.hide(); }
       return;
     }
+    if (pausedAt !== null) return;
     keysDown.add(e.key);
     if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) {
       e.preventDefault();
@@ -407,7 +414,7 @@ export function startGame(
   let activeTouches: { x: number; y: number }[] = [];
   function handleTouch(e: TouchEvent): void {
     e.preventDefault();
-    activeTouches = Array.from(e.touches).map((t) => ({ x: t.clientX, y: t.clientY }));
+    activeTouches = pausedAt !== null ? [] : Array.from(e.touches).map((t) => ({ x: t.clientX, y: t.clientY }));
   }
   if (!display) {
     canvas.addEventListener("touchstart", handleTouch);
@@ -465,6 +472,25 @@ export function startGame(
       socket.close();
     }
   });
+
+  function updatePlaySchedule(schedule: PlaySchedule | null): void {
+    const now = performance.now();
+    if (schedule?.phase === "paused" && pausedAt === null) {
+      pausedAt = now;
+      keysDown.clear();
+      activeTouches = [];
+      lastSentThrust = 0;
+      lastSentRotation = 0;
+    } else if (schedule?.phase !== "paused" && pausedAt !== null) {
+      const duration = now - pausedAt;
+      roundStartTime += duration;
+      revealStartTime += duration;
+      endgameStartTime += duration;
+      pausedAt = null;
+      lastServerTime = now;
+    }
+    scheduleScreen.update(schedule);
+  }
 
   socket.addEventListener("message", (e) => {
     // Binary messages: world updates and crash events
@@ -530,6 +556,9 @@ export function startGame(
     }
 
     switch (data.type) {
+      case "play_schedule":
+        updatePlaySchedule(data.schedule);
+        break;
       case "camera":
         displayCamera = data.camera;
         break;
@@ -592,6 +621,8 @@ export function startGame(
           idToName.set(id, player.name ?? "Pilot");
         }
         lastServerTime = performance.now();
+        pausedAt = null;
+        updatePlaySchedule(data.playSchedule ?? null);
         break;
 
       case "player_join":
@@ -693,6 +724,9 @@ export function startGame(
     // Logical canvas dimensions (CSS pixels)
     const w = canvas.width / dpr;
     const h = canvas.height / dpr;
+
+    // The pause screen covers the game. Freeze rendering and controls as well as physics.
+    if (pausedAt !== null) return;
 
     // ── Mobile button positions ──
     const btnR = Math.max(Math.min(w, h) * 0.09, 32);
@@ -1081,6 +1115,7 @@ export function startGame(
 
   // ── Cleanup ──
   return () => {
+    scheduleScreen.destroy();
     displaySettings?.destroy();
     statsScreen?.destroy();
     cancelAnimationFrame(animationId);

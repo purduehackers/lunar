@@ -34,6 +34,14 @@ Pilot records use a saved browser ID, so reconnecting or changing a name preserv
 
 Run `node tests/session-stats.test.cjs` and `node tests/session-lifecycle.test.cjs` to check stats accounting, unique ships, session creation, and expiry.
 
+## Hack Night play windows
+
+A session named **Hack Night** (case-insensitive) automatically follows Purdue's local time (`America/Indiana/Indianapolis`). Play is unrestricted before 9:00 p.m. Starting at 9:00 p.m., the game pauses for the first 45 minutes of every hour and opens for the final 15 minutes: paused 9:00–9:45, playable 9:45–10:00, paused 10:00–10:45, and so on through midnight until the session ends. Sessions opened between midnight and 9:00 a.m. use the previous night's schedule.
+
+Players and displays show a pause screen with a countdown, plus the time remaining during play windows. The server freezes ships and round timers and rejects flight input during pauses, including for newly connected players. Flights resume automatically; paused time is excluded from landing records. Connected-time totals still measure time connected. The schedule survives restarts through the saved session. Other session names and play without a session remain unrestricted; renaming or ending a Hack Night session updates the schedule immediately.
+
+Run `node tests/play-schedule.test.cjs` to check schedule boundaries, overnight play, time zones, and server pause/resume behavior.
+
 ## Development
 
 ```sh
